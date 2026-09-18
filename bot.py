@@ -1,10 +1,12 @@
 import os
 import requests
 import xml.etree.ElementTree as ET
-import subprocess
+import re
+from openai import OpenAI
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL = os.environ["CHANNEL"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 RSS_URL = (
     "https://news.google.com/rss/search?"
@@ -13,6 +15,8 @@ RSS_URL = (
 )
 
 SENT_FILE = "sent_links.txt"
+
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 def send_message(text):
@@ -44,6 +48,43 @@ def save_sent_link(link):
         f.write(link + "\n")
 
 
+def clean_html(text):
+    if not text:
+        return ""
+
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+def create_persian_summary(title, description):
+    description = clean_html(description)
+
+    source_text = f"""
+عنوان خبر:
+{title}
+
+توضیحات خبر:
+{description}
+"""
+
+    response = client.responses.create(
+        model="gpt-5.6-luna",
+        instructions=(
+            "تو یک سردبیر خبری فارسی‌زبان هستی. "
+            "برای خبر زیر یک خلاصه کوتاه و دقیق به فارسی بنویس. "
+            "خلاصه باید فقط 2 تا 3 جمله باشد. "
+            "بی‌طرفانه بنویس و هیچ اطلاعاتی خارج از متن ورودی اضافه نکن. "
+            "اگر اطلاعات کافی وجود ندارد، حدس نزن. "
+            "فقط خود خلاصه را برگردان و هیچ عنوان یا توضیح اضافه ننویس."
+        ),
+        input=source_text,
+    )
+
+    return response.output_text.strip()
+
+
 def main():
     response = requests.get(RSS_URL, timeout=20)
     response.raise_for_status()
@@ -56,6 +97,7 @@ def main():
     for item in items:
         title = item.findtext("title")
         link = item.findtext("link")
+        description = item.findtext("description")
 
         if not title or not link:
             continue
@@ -63,15 +105,19 @@ def main():
         if link in sent_links:
             continue
 
+        summary = create_persian_summary(title, description)
+
         message = (
             f"🚨 {title}\n\n"
-            f"🔗 منبع خبر:\n{link}\n\n"
+            f"📝 خلاصه خبر:\n"
+            f"{summary}\n\n"
+            f"🔗 منبع خبر:\n"
+            f"{link}\n\n"
             f"جهان تاب تحولات جهان\n"
             f"@jahantab_news"
         )
 
         send_message(message)
-
         save_sent_link(link)
 
         break
