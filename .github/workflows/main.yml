@@ -21,13 +21,14 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: Install requests
-        run: pip install requests
+      - name: Install dependencies
+        run: pip install requests openai
 
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHANNEL: ${{ secrets.CHANNEL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python bot.py
 
       - name: Save sent links
