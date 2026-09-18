@@ -27,6 +27,7 @@ def send_message(text):
         data={
             "chat_id": CHANNEL,
             "text": text,
+            "parse_mode": "HTML",
             "disable_web_page_preview": False,
         },
         timeout=20,
@@ -111,8 +112,7 @@ def main():
             f"🚨 {title}\n\n"
             f"📝 خلاصه خبر:\n"
             f"{summary}\n\n"
-            f"🔗 منبع خبر:\n"
-            f"{link}\n\n"
+            f'🔗 <a href="{link}">مشاهده خبر</a>\n\n'
             f"جهان تاب تحولات جهان\n"
             f"@jahantab_news"
         )
