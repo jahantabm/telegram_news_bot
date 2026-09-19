@@ -4,6 +4,7 @@ import html
 import json
 import xml.etree.ElementTree as ET
 from io import BytesIO
+from datetime import datetime, timezone
 from urllib.parse import quote_plus, urljoin
 
 import requests
@@ -14,21 +15,6 @@ from openai import OpenAI
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL = os.environ["CHANNEL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-
-
-# موضوعات خبری موردنظر
-RSS_QUERY = (
-    '("ایران" OR "حشد الشعبی" OR "حزب الله" OR "حماس" OR '
-    '"انصارالله" OR "حوثی" OR "غزه" OR "لبنان" OR "یمن") '
-    '(جنگ OR حمله OR موشک OR پهپاد OR درگیری OR آتش‌بس OR مذاکره OR '
-    'آمریکا OR اسرائیل OR عملیات OR حملات)'
-)
-
-RSS_URL = (
-    "https://news.google.com/rss/search?q="
-    + quote_plus(RSS_QUERY)
-    + "&hl=fa&gl=IR&ceid=IR:fa"
-)
 
 
 LOGO_FILE = "jahantab_logo_transparent-1.png"
@@ -43,68 +29,270 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+        "AppleWebKit/537.36 "
+        "Chrome/120 Safari/537.36"
     )
 }
 
 
+# ============================================================
+# منابع مجاز
+# ============================================================
+
+SOURCES = {
+    "Reuters": "reuters.com",
+    "Sputnik": "sputniknews.com",
+    "Associated Press": "apnews.com",
+    "CNN": "cnn.com",
+    "Fars": "farsnews.ir",
+    "Mehr": "mehrnews.com",
+    "IRNA": "irna.ir",
+    "ISNA": "isna.ir",
+    "Tasnim": "tasnimnews.com",
+    "Khabar Online": "khabaronline.ir",
+    "Khabar Foori": "khabarfarsi.com",
+    "Al-Manar": "almanar.com.lb",
+}
+
+
+# نام‌هایی که ممکن است در RSS با شکل‌های مختلف بیایند
+SOURCE_ALIASES = {
+    "reuters": "Reuters",
+    "رویترز": "Reuters",
+
+    "sputnik": "Sputnik",
+    "اسپوتنیک": "Sputnik",
+
+    "associated press": "Associated Press",
+    "ap": "Associated Press",
+    "آسوشیتدپرس": "Associated Press",
+
+    "cnn": "CNN",
+    "سی ان ان": "CNN",
+
+    "fars": "Fars",
+    "fars news": "Fars",
+    "فارس": "Fars",
+
+    "mehr": "Mehr",
+    "mehr news": "Mehr",
+    "مهر": "Mehr",
+
+    "irna": "IRNA",
+    "irna news": "IRNA",
+    "ایرنا": "IRNA",
+
+    "isna": "ISNA",
+    "ایسنا": "ISNA",
+
+    "tasnim": "Tasnim",
+    "tasnim news": "Tasnim",
+    "تسنیم": "Tasnim",
+
+    "khabar online": "Khabar Online",
+    "خبرآنلاین": "Khabar Online",
+
+    "khabar foori": "Khabar Foori",
+    "خبر فوری": "Khabar Foori",
+
+    "al-manar": "Al-Manar",
+    "al manar": "Al-Manar",
+    "المنار": "Al-Manar",
+}
+
+
+# ============================================================
+# موضوعات
+# ============================================================
+
+RSS_TOPIC_QUERY = (
+    '("ایران" OR "جنگ ایران" OR "آمریکا" OR '
+    '"حشد الشعبی" OR "حزب الله" OR "حماس" OR '
+    '"انصارالله" OR "حوثی" OR "غزه" OR "لبنان" OR "یمن") '
+    '(جنگ OR حمله OR حملات OR موشک OR موشکی OR پهپاد OR '
+    'درگیری OR آتش‌بس OR مذاکره OR عملیات OR اسرائیل OR آمریکا OR '
+    'نیروهای آمریکایی OR پایگاه OR دریای سرخ OR باب‌المندب OR هرمز)'
+)
+
+
+def build_rss_url(domain):
+    query = (
+        f"site:{domain} "
+        f"({RSS_TOPIC_QUERY})"
+    )
+
+    return (
+        "https://news.google.com/rss/search?q="
+        + quote_plus(query)
+        + "&hl=fa&gl=IR&ceid=IR:fa"
+    )
+
+
+# ============================================================
+# ابزارهای عمومی
+# ============================================================
+
 def clean(text):
-    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = re.sub(
+        r"<[^>]+>",
+        " ",
+        text or "",
+    )
+
     text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
+
+    return re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
 
 
 def load_sent():
     if not os.path.exists(SENT_FILE):
         return set()
 
-    with open(SENT_FILE, encoding="utf-8") as f:
-        return {x.strip() for x in f if x.strip()}
+    with open(
+        SENT_FILE,
+        encoding="utf-8",
+    ) as f:
+        return {
+            x.strip()
+            for x in f
+            if x.strip()
+        }
 
 
 def save_sent(link):
-    with open(SENT_FILE, "a", encoding="utf-8") as f:
+    with open(
+        SENT_FILE,
+        "a",
+        encoding="utf-8",
+    ) as f:
         f.write(link + "\n")
 
 
-def classify_news(title, description):
+def normalize_source(source):
+    source = clean(source).lower()
+
+    for key, value in SOURCE_ALIASES.items():
+        if key in source:
+            return value
+
+    return None
+
+
+def get_source_name(item):
+    source = item.find("source")
+
+    if source is not None:
+        name = (
+            source.text
+            or ""
+        )
+
+        normalized = normalize_source(name)
+
+        if normalized:
+            return normalized
+
+    # اگر source وجود نداشت، از URL کمک می‌گیریم
+    link = (
+        item.findtext("link")
+        or ""
+    ).lower()
+
+    for name, domain in SOURCES.items():
+        if domain in link:
+            return name
+
+    return None
+
+
+def get_pub_date(item):
+    date_text = (
+        item.findtext("pubDate")
+        or ""
+    ).strip()
+
+    if not date_text:
+        return datetime.min.replace(
+            tzinfo=timezone.utc
+        )
+
+    try:
+        from email.utils import parsedate_to_datetime
+
+        value = parsedate_to_datetime(
+            date_text
+        )
+
+        if value.tzinfo is None:
+            value = value.replace(
+                tzinfo=timezone.utc
+            )
+
+        return value
+
+    except Exception:
+        return datetime.min.replace(
+            tzinfo=timezone.utc
+        )
+
+
+# ============================================================
+# تشخیص اهمیت و ارتباط خبر
+# ============================================================
+
+def classify_news(
+    title,
+    description,
+    source,
+):
     text = (
+        f"منبع: {source}\n"
         f"عنوان: {clean(title)}\n"
         f"توضیح: {clean(description)}"
     )
 
     instructions = """
-تو یک سردبیر خبر فارسی هستی که فقط وظیفه‌ات تشخیص ارتباط و اهمیت خبر است.
+تو سردبیر یک کانال خبری فارسی هستی.
 
-موضوعات موردنظر:
+فقط خبرهای مهم و مرتبط با این حوزه‌ها را انتخاب کن:
 
-- ایران و تحولات مستقیم جنگ یا درگیری ایران و آمریکا
-- حملات، پاسخ‌های نظامی، موشکی و پهپادی مرتبط با ایران و منطقه
-- حشد الشعبی عراق و تحولات امنیتی مهم مرتبط با آن
-- حزب‌الله لبنان و تحولات مهم مرتبط با درگیری لبنان
-- حماس و جنگ و تحولات مهم غزه و فلسطین
-- انصارالله/حوثی‌ها و تحولات مهم یمن، دریای سرخ و باب‌المندب
-- تحولات مهم دیپلماتیک، آتش‌بس یا مذاکرات مستقیم مرتبط با این پرونده‌ها
+1. ایران و جنگ یا درگیری مستقیم ایران و آمریکا
+2. حملات، پاسخ‌های نظامی، موشکی و پهپادی مرتبط با ایران
+3. حشد الشعبی عراق و تحولات مهم امنیتی مرتبط با آن
+4. حزب‌الله لبنان و تحولات مهم نظامی یا امنیتی لبنان
+5. حماس، غزه و تحولات مهم جنگ و مذاکرات مرتبط با آن
+6. انصارالله/حوثی‌های یمن
+7. دریای سرخ، باب‌المندب و تحولات نظامی مرتبط
+8. اسرائیل، فقط وقتی خبر مستقیماً به پرونده ایران،
+   جنگ منطقه، غزه، لبنان یا گروه‌های ذکرشده مربوط باشد.
+9. مذاکرات، آتش‌بس، تصمیم‌های مهم سیاسی یا نظامی
+   که مستقیماً به این پرونده‌ها مربوط باشند.
 
-خبر فقط وقتی قابل انتشار است که:
+خبرهای زیر را منتشر نکن:
 
-1. به یکی از موضوعات بالا ارتباط مستقیم داشته باشد.
-2. یک تحول خبری قابل‌توجه داشته باشد؛
-   مثل حمله، پاسخ، درگیری مهم، تصمیم مهم دولتی یا نظامی،
-   مذاکره مهم، آتش‌بس یا تحول امنیتی جدی.
+- فوتبال و ورزش
+- سینما و سرگرمی
+- اقتصاد عادی
+- قیمت‌ها و بازارهای عادی
+- حوادث عادی
+- اخبار اجتماعی عادی
+- اخبار فناوری عادی
+- اخبار ایران که ارتباطی با موضوعات بالا ندارند
+- تحلیل‌های کم‌اهمیت
+- خبرهای تکراری یا صرفاً حاشیه‌ای
 
-خبرهای ورزشی، سرگرمی، اقتصادی عادی، اجتماعی عادی
-و خبرهای عمومی ایران که ارتباط مستقیمی با موضوعات بالا ندارند
-باید حذف شوند.
-
-فقط یکی از این سه کلمه را برگردان:
+فقط یکی از این سه عبارت را برگردان:
 
 PUBLISH
-SKIP
 URGENT
+SKIP
 
-URGENT فقط وقتی است که خبر طبق متن ارائه‌شده
-ماهیت فوری، در حال وقوع یا بسیار تازه داشته باشد.
+URGENT یعنی خبر بسیار تازه و مهم است و
+ماهیت فوری یا در حال وقوع دارد.
 
 هیچ توضیح دیگری ننویس.
 """
@@ -116,7 +304,11 @@ URGENT فقط وقتی است که خبر طبق متن ارائه‌شده
             input=text,
         )
 
-        result = response.output_text.strip().upper()
+        result = (
+            response.output_text
+            .strip()
+            .upper()
+        )
 
         if result.startswith("URGENT"):
             return "URGENT"
@@ -125,15 +317,27 @@ URGENT فقط وقتی است که خبر طبق متن ارائه‌شده
             return "PUBLISH"
 
     except Exception as e:
-        print("Classifier error:", e)
+        print(
+            "Classifier error:",
+            e,
+        )
 
     return "SKIP"
 
 
-def make_summary(title, description):
+# ============================================================
+# خلاصه خبر
+# ============================================================
+
+def make_summary(
+    title,
+    description,
+):
     source = (
-        f"عنوان خبر:\n{title}\n\n"
-        f"متن خبر:\n{clean(description)}"
+        f"عنوان خبر:\n"
+        f"{title}\n\n"
+        f"متن خبر:\n"
+        f"{clean(description)}"
     )
 
     try:
@@ -141,45 +345,76 @@ def make_summary(title, description):
             model="gpt-5.6-luna",
             instructions=(
                 "تو سردبیر خبری فارسی‌زبان هستی. "
-                "خبر را در 2 تا 3 جمله کوتاه، دقیق و بی‌طرف خلاصه کن. "
-                "هیچ اطلاعاتی خارج از متن اضافه نکن. "
+                "خبر را در 2 تا 3 جمله کوتاه و دقیق خلاصه کن. "
+                "بی‌طرف باش و هیچ اطلاعاتی خارج از متن اضافه نکن. "
                 "فقط خلاصه را بنویس."
             ),
             input=source,
         )
 
-        result = response.output_text.strip()
+        result = (
+            response.output_text
+            .strip()
+        )
 
         if result:
             return result
 
     except Exception as e:
-        print("Summary error:", e)
+        print(
+            "Summary error:",
+            e,
+        )
 
-    return clean(description)[:500] or title
+    return (
+        clean(description)[:500]
+        or title
+    )
 
 
-def find_rss_image_url(item):
+# ============================================================
+# پیدا کردن عکس
+# ============================================================
+
+def find_rss_image_urls(item):
     candidates = []
 
     for child in item:
         tag = child.tag.lower()
 
-        if tag.endswith("content") or tag.endswith("thumbnail"):
-            url = child.attrib.get("url")
+        if (
+            tag.endswith("content")
+            or tag.endswith("thumbnail")
+        ):
+            url = child.attrib.get(
+                "url"
+            )
 
             if url:
-                candidates.append(url)
+                candidates.append(
+                    url
+                )
 
-    enclosure = item.find("enclosure")
+    enclosure = item.find(
+        "enclosure"
+    )
 
     if enclosure is not None:
-        url = enclosure.attrib.get("url")
+        url = enclosure.attrib.get(
+            "url"
+        )
 
         if url:
-            candidates.append(url)
+            candidates.append(
+                url
+            )
 
-    description = item.findtext("description") or ""
+    description = (
+        item.findtext(
+            "description"
+        )
+        or ""
+    )
 
     match = re.search(
         r'<img[^>]+src=["\']([^"\']+)',
@@ -189,13 +424,18 @@ def find_rss_image_url(item):
 
     if match:
         candidates.append(
-            html.unescape(match.group(1))
+            html.unescape(
+                match.group(1)
+            )
         )
 
     return candidates
 
 
-def extract_meta_images(page_text, final_url):
+def extract_meta_images(
+    page_text,
+    final_url,
+):
     candidates = []
 
     patterns = [
@@ -214,16 +454,20 @@ def extract_meta_images(page_text, final_url):
             candidates.append(
                 urljoin(
                     final_url,
-                    html.unescape(match.group(1)),
+                    html.unescape(
+                        match.group(1)
+                    ),
                 )
             )
 
     # JSON-LD
-    for block in re.findall(
+    blocks = re.findall(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         page_text,
         re.IGNORECASE | re.DOTALL,
-    ):
+    )
+
+    for block in blocks:
         try:
             data = json.loads(
                 html.unescape(block)
@@ -232,49 +476,92 @@ def extract_meta_images(page_text, final_url):
             def collect_images(obj):
                 found = []
 
-                if isinstance(obj, dict):
-                    value = obj.get("image")
+                if isinstance(
+                    obj,
+                    dict,
+                ):
+                    image = obj.get(
+                        "image"
+                    )
 
-                    if isinstance(value, str):
-                        found.append(value)
-
-                    elif isinstance(value, dict):
-                        url = (
-                            value.get("url")
-                            or value.get("contentUrl")
+                    if isinstance(
+                        image,
+                        str,
+                    ):
+                        found.append(
+                            image
                         )
 
-                        if isinstance(url, str):
-                            found.append(url)
+                    elif isinstance(
+                        image,
+                        dict,
+                    ):
+                        url = (
+                            image.get("url")
+                            or image.get(
+                                "contentUrl"
+                            )
+                        )
 
-                    elif isinstance(value, list):
-                        for item in value:
-                            if isinstance(item, str):
-                                found.append(item)
+                        if url:
+                            found.append(
+                                url
+                            )
 
-                            elif isinstance(item, dict):
-                                url = (
-                                    item.get("url")
-                                    or item.get("contentUrl")
+                    elif isinstance(
+                        image,
+                        list,
+                    ):
+                        for value in image:
+                            if isinstance(
+                                value,
+                                str,
+                            ):
+                                found.append(
+                                    value
                                 )
 
-                                if isinstance(url, str):
-                                    found.append(url)
+                            elif isinstance(
+                                value,
+                                dict,
+                            ):
+                                url = (
+                                    value.get(
+                                        "url"
+                                    )
+                                    or value.get(
+                                        "contentUrl"
+                                    )
+                                )
+
+                                if url:
+                                    found.append(
+                                        url
+                                    )
 
                     for value in obj.values():
                         found.extend(
-                            collect_images(value)
+                            collect_images(
+                                value
+                            )
                         )
 
-                elif isinstance(obj, list):
-                    for item in obj:
+                elif isinstance(
+                    obj,
+                    list,
+                ):
+                    for value in obj:
                         found.extend(
-                            collect_images(item)
+                            collect_images(
+                                value
+                            )
                         )
 
                 return found
 
-            for image_url in collect_images(data):
+            for image_url in collect_images(
+                data
+            ):
                 candidates.append(
                     urljoin(
                         final_url,
@@ -294,7 +581,9 @@ def extract_meta_images(page_text, final_url):
         candidates.append(
             urljoin(
                 final_url,
-                html.unescape(match.group(1)),
+                html.unescape(
+                    match.group(1)
+                ),
             )
         )
 
@@ -328,18 +617,25 @@ def download_image(
 
         content_type = (
             response.headers
-            .get("content-type", "")
+            .get(
+                "content-type",
+                "",
+            )
             .lower()
         )
 
         if (
             content_type
-            and not content_type.startswith("image/")
+            and not content_type.startswith(
+                "image/"
+            )
         ):
             return None
 
         image = Image.open(
-            BytesIO(response.content)
+            BytesIO(
+                response.content
+            )
         ).convert("RGBA")
 
         if (
@@ -348,20 +644,29 @@ def download_image(
         ):
             return None
 
-        ratio = image.width / image.height
+        ratio = (
+            image.width /
+            image.height
+        )
 
-        if ratio < 0.35 or ratio > 3.2:
+        if (
+            ratio < 0.35
+            or ratio > 3.2
+        ):
             return None
 
         return image
 
     except Exception as e:
-        print("Image error:", e)
+        print(
+            "Image error:",
+            e,
+        )
 
     return None
 
 
-def find_best_article_image(link):
+def find_article_image(link):
     try:
         response = requests.get(
             link,
@@ -392,22 +697,29 @@ def find_best_article_image(link):
 
     except Exception as e:
         print(
-            "Article page error:",
+            "Article image error:",
             e,
         )
 
     return None
 
 
-def prepare_image(item, link):
-    # اول عکس اصلی منبع خبر
-    image = find_best_article_image(link)
+def prepare_image(
+    item,
+    link,
+):
+    # 1. عکس اصلی خود منبع
+    image = find_article_image(
+        link
+    )
 
     if image is not None:
         return image
 
-    # بعد عکس RSS / Google News
-    for image_url in find_rss_image_url(item):
+    # 2. عکس RSS
+    for image_url in find_rss_image_urls(
+        item
+    ):
         image = download_image(
             image_url
         )
@@ -420,8 +732,10 @@ def prepare_image(item, link):
 
             return image
 
-    # عکس پیش‌فرض اختصاصی
-    if os.path.exists(FALLBACK_FILE):
+    # 3. عکس پیش‌فرض خودمان
+    if os.path.exists(
+        FALLBACK_FILE
+    ):
         try:
             image = Image.open(
                 FALLBACK_FILE
@@ -435,12 +749,16 @@ def prepare_image(item, link):
 
         except Exception as e:
             print(
-                "Fallback image error:",
+                "Fallback error:",
                 e,
             )
 
     return create_fallback()
 
+
+# ============================================================
+# لوگو و ظاهر تصویر
+# ============================================================
 
 def load_logo():
     try:
@@ -471,18 +789,24 @@ def get_font(size):
 def add_branding(image):
     image = image.convert("RGBA")
 
-    draw = ImageDraw.Draw(image)
+    draw = ImageDraw.Draw(
+        image
+    )
 
     logo = load_logo()
 
     margin = max(
         18,
-        int(image.width * 0.025),
+        int(
+            image.width * 0.025
+        ),
     )
 
     panel_height = max(
         105,
-        int(image.height * 0.16),
+        int(
+            image.height * 0.16
+        ),
     )
 
     panel = Image.new(
@@ -491,14 +815,20 @@ def add_branding(image):
             image.width,
             panel_height,
         ),
-        (0, 0, 0, 155),
+        (
+            0,
+            0,
+            0,
+            155,
+        ),
     )
 
     image.alpha_composite(
         panel,
         (
             0,
-            image.height - panel_height,
+            image.height
+            - panel_height,
         ),
     )
 
@@ -514,17 +844,27 @@ def add_branding(image):
 
         logo = logo.resize(
             (
-                int(logo.width * ratio),
-                int(logo.height * ratio),
+                int(
+                    logo.width *
+                    ratio
+                ),
+                int(
+                    logo.height *
+                    ratio
+                ),
             ),
             Image.LANCZOS,
         )
 
         max_logo_height = (
-            panel_height - margin * 2
+            panel_height
+            - margin * 2
         )
 
-        if logo.height > max_logo_height:
+        if (
+            logo.height
+            > max_logo_height
+        ):
             ratio = (
                 max_logo_height /
                 logo.height
@@ -532,8 +872,14 @@ def add_branding(image):
 
             logo = logo.resize(
                 (
-                    int(logo.width * ratio),
-                    int(logo.height * ratio),
+                    int(
+                        logo.width *
+                        ratio
+                    ),
+                    int(
+                        logo.height *
+                        ratio
+                    ),
                 ),
                 Image.LANCZOS,
             )
@@ -561,7 +907,10 @@ def add_branding(image):
     font = get_font(
         max(
             24,
-            int(image.width * 0.026),
+            int(
+                image.width
+                * 0.026
+            ),
         )
     )
 
@@ -597,13 +946,24 @@ def add_branding(image):
 
     draw.rounded_rectangle(
         (
-            text_x - padding_x,
-            text_y - padding_y,
-            text_x + text_width + padding_x,
-            text_y + text_height + padding_y,
+            text_x
+            - padding_x,
+            text_y
+            - padding_y,
+            text_x
+            + text_width
+            + padding_x,
+            text_y
+            + text_height
+            + padding_y,
         ),
         radius=14,
-        fill=(0, 0, 0, 175),
+        fill=(
+            0,
+            0,
+            0,
+            175,
+        ),
     )
 
     draw.text(
@@ -629,10 +989,17 @@ def create_fallback():
             width,
             height,
         ),
-        (25, 31, 42, 255),
+        (
+            25,
+            31,
+            42,
+            255,
+        ),
     )
 
-    draw = ImageDraw.Draw(image)
+    draw = ImageDraw.Draw(
+        image
+    )
 
     font = get_font(42)
 
@@ -650,28 +1017,45 @@ def create_fallback():
     return image
 
 
+# ============================================================
+# کپشن تلگرام
+# ============================================================
+
 def make_caption(
     title,
     summary,
     link,
     status,
+    source,
 ):
-    title = html.escape(title)
-    summary = html.escape(summary)
+    title = html.escape(
+        title
+    )
+
+    summary = html.escape(
+        summary
+    )
+
     link = html.escape(
         link,
         quote=True,
     )
 
-    prefix = (
-        "🚨 <b>فوری</b>\n"
-        if status == "URGENT"
-        else ""
+    source = html.escape(
+        source
     )
+
+    prefix = ""
+
+    if status == "URGENT":
+        prefix = (
+            "🚨 <b>خبر فوری</b>\n\n"
+        )
 
     caption = (
         f"{prefix}"
         f"📰 <b>{title}</b>\n\n"
+        f"📡 <b>منبع:</b> {source}\n\n"
         f"📝 <b>خلاصه خبر</b>\n"
         f"{summary}\n\n"
         f'🔗 <a href="{link}">'
@@ -685,6 +1069,7 @@ def make_caption(
     fixed = (
         f"{prefix}"
         f"📰 <b>{title}</b>\n\n"
+        f"📡 <b>منبع:</b> {source}\n\n"
         f"📝 <b>خلاصه خبر</b>\n\n"
         f'🔗 <a href="{link}">'
         f"مشاهده خبر اصلی"
@@ -693,14 +1078,20 @@ def make_caption(
 
     available = max(
         100,
-        1024 - len(fixed) - 10,
+        1024
+        - len(fixed)
+        - 10,
     )
 
-    summary = summary[:available].rstrip()
+    summary = (
+        summary[:available]
+        .rstrip()
+    )
 
     return (
         f"{prefix}"
         f"📰 <b>{title}</b>\n\n"
+        f"📡 <b>منبع:</b> {source}\n\n"
         f"📝 <b>خلاصه خبر</b>\n"
         f"{summary}\n\n"
         f'🔗 <a href="{link}">'
@@ -715,10 +1106,13 @@ def send_photo(
     summary,
     link,
     status,
+    source,
 ):
     buffer = BytesIO()
 
-    image.convert("RGB").save(
+    image.convert(
+        "RGB"
+    ).save(
         buffer,
         "JPEG",
         quality=92,
@@ -736,6 +1130,7 @@ def send_photo(
                 summary,
                 link,
                 status,
+                source,
             ),
             "parse_mode": "HTML",
         },
@@ -758,33 +1153,89 @@ def send_photo(
     response.raise_for_status()
 
 
+# ============================================================
+# دریافت خبرها
+# ============================================================
+
+def fetch_source_items():
+    all_items = []
+
+    for source_name, domain in SOURCES.items():
+        rss_url = build_rss_url(
+            domain
+        )
+
+        print(
+            "Fetching:",
+            source_name,
+        )
+
+        try:
+            response = requests.get(
+                rss_url,
+                headers=HEADERS,
+                timeout=30,
+            )
+
+            response.raise_for_status()
+
+            root = ET.fromstring(
+                response.text
+            )
+
+            items = root.findall(
+                "./channel/item"
+            )
+
+            for item in items:
+                actual_source = get_source_name(
+                    item
+                )
+
+                # فقط منبع‌های مجاز
+                if not actual_source:
+                    continue
+
+                if actual_source != source_name:
+                    continue
+
+                all_items.append(
+                    item
+                )
+
+        except Exception as e:
+            print(
+                "RSS error:",
+                source_name,
+                e,
+            )
+
+    # جدیدترین‌ها اول
+    all_items.sort(
+        key=get_pub_date,
+        reverse=True,
+    )
+
+    return all_items
+
+
+# ============================================================
+# اجرای اصلی
+# ============================================================
+
 def main():
     print(
         "Starting Telegram News Bot..."
     )
 
-    response = requests.get(
-        RSS_URL,
-        headers=HEADERS,
-        timeout=30,
-    )
+    items = fetch_source_items()
 
-    response.raise_for_status()
-
-    root = ET.fromstring(
-        response.text
-    )
-
-    items = root.findall(
-        "./channel/item"
+    print(
+        "Allowed-source items:",
+        len(items),
     )
 
     sent = load_sent()
-
-    print(
-        "RSS items:",
-        len(items),
-    )
 
     for item in items:
         title = (
@@ -798,11 +1249,21 @@ def main():
         ).strip()
 
         description = (
-            item.findtext("description")
+            item.findtext(
+                "description"
+            )
             or ""
         )
 
-        if not title or not link:
+        source = get_source_name(
+            item
+        )
+
+        if (
+            not title
+            or not link
+            or not source
+        ):
             continue
 
         if link in sent:
@@ -810,12 +1271,15 @@ def main():
 
         print(
             "Checking:",
+            source,
+            "|",
             title,
         )
 
         status = classify_news(
             title,
             description,
+            source,
         )
 
         print(
@@ -846,12 +1310,15 @@ def main():
             summary,
             link,
             status,
+            source,
         )
 
         save_sent(link)
 
         print(
-            "Published successfully."
+            "Published successfully:",
+            source,
+            title,
         )
 
         break
