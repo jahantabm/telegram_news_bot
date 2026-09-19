@@ -30,3 +30,17 @@ jobs:
           CHANNEL: "@jahantab_news"
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python bot.py
+
+      - name: Save sent links
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add sent_links.txt
+
+          if git diff --cached --quiet; then
+            echo "No new sent links to save."
+          else
+            git commit -m "Update sent news links"
+            git push
+          fi
