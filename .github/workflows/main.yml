@@ -27,5 +27,6 @@ jobs:
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL: "@jahantab_news"
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python bot.py
