@@ -1,384 +1,470 @@
 import os
 import re
 import html
-import json
 import xml.etree.ElementTree as ET
 from io import BytesIO
-from datetime import datetime, timezone
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import urljoin, quote_plus
+from datetime import datetime, timezone, timedelta
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
 from openai import OpenAI
 
 
+# =========================================================
+# SETTINGS
+# =========================================================
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL = os.environ["CHANNEL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
-
 LOGO_FILE = "jahantab_logo_transparent-1.png"
 FALLBACK_FILE = "fallback_news.jpg"
 SENT_FILE = "sent_links.txt"
+
 CHANNEL_TEXT = "@jahantab_news"
 
+MAX_POSTS_PER_RUN = 1
+MAX_AGE_HOURS = 48
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+RSS_TIMEOUT = 15
+ARTICLE_TIMEOUT = 10
+IMAGE_TIMEOUT = 10
+TELEGRAM_TIMEOUT = 25
+OPENAI_TIMEOUT = 25
 
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 "
-        "Chrome/120 Safari/537.36"
+        "AppleWebKit/537.36 Chrome/120 Safari/537.36"
     )
 }
 
 
-# ============================================================
-# منابع مجاز
-# ============================================================
+# =========================================================
+# SOURCES
+# =========================================================
 
-SOURCES = {
-    "Reuters": "reuters.com",
-    "Sputnik": "sputniknews.com",
-    "Associated Press": "apnews.com",
-    "CNN": "cnn.com",
-    "Fars": "farsnews.ir",
-    "Mehr": "mehrnews.com",
-    "IRNA": "irna.ir",
-    "ISNA": "isna.ir",
-    "Tasnim": "tasnimnews.com",
-    "Khabar Online": "khabaronline.ir",
-    "Khabar Foori": "khabarfarsi.com",
-    "Al-Manar": "almanar.com.lb",
+SOURCE_DOMAINS = {
+    "reuters.com",
+    "apnews.com",
+    "cnn.com",
+    "sputniknews.com",
+    "ir.sputniknews.com",
+
+    "farsnews.ir",
+    "mehrnews.com",
+    "irna.ir",
+    "isna.ir",
+    "tasnimnews.com",
+
+    "khabaronline.ir",
+    "khabarfouri.com",
+    "khabarfoori.com",
+
+    "almanar.com.lb",
+
+    # New sources
+    "aljazeera.net",
+    "hamshahrionline.ir",
 }
 
 
-# نام‌هایی که ممکن است در RSS با شکل‌های مختلف بیایند
-SOURCE_ALIASES = {
-    "reuters": "Reuters",
-    "رویترز": "Reuters",
+SOURCE_NAMES = {
+    "reuters",
+    "reuters.com",
+    "associated press",
+    "ap",
+    "ap news",
+    "cnn",
 
-    "sputnik": "Sputnik",
-    "اسپوتنیک": "Sputnik",
+    "sputnik",
 
-    "associated press": "Associated Press",
-    "ap": "Associated Press",
-    "آسوشیتدپرس": "Associated Press",
+    "فارس",
+    "خبرگزاری فارس",
 
-    "cnn": "CNN",
-    "سی ان ان": "CNN",
+    "مهر",
+    "خبرگزاری مهر",
 
-    "fars": "Fars",
-    "fars news": "Fars",
-    "فارس": "Fars",
+    "ایرنا",
+    "خبرگزاری جمهوری اسلامی",
 
-    "mehr": "Mehr",
-    "mehr news": "Mehr",
-    "مهر": "Mehr",
+    "ایسنا",
+    "خبرگزاری ایسنا",
 
-    "irna": "IRNA",
-    "irna news": "IRNA",
-    "ایرنا": "IRNA",
+    "تسنیم",
+    "خبرگزاری تسنیم",
 
-    "isna": "ISNA",
-    "ایسنا": "ISNA",
+    "خبرآنلاین",
 
-    "tasnim": "Tasnim",
-    "tasnim news": "Tasnim",
-    "تسنیم": "Tasnim",
+    "خبر فوری",
 
-    "khabar online": "Khabar Online",
-    "خبرآنلاین": "Khabar Online",
+    "المنار",
+    "al-manar",
 
-    "khabar foori": "Khabar Foori",
-    "خبر فوری": "Khabar Foori",
+    # New sources
+    "الجزیره",
+    "الجزيره",
+    "al jazeera",
+    "aljazeera",
 
-    "al-manar": "Al-Manar",
-    "al manar": "Al-Manar",
-    "المنار": "Al-Manar",
+    "همشهری",
+    "همشهری آنلاین",
+    "hamshahri",
 }
 
 
-# ============================================================
-# موضوعات
-# ============================================================
+# =========================================================
+# TOPIC FILTER
+# =========================================================
 
-RSS_TOPIC_QUERY = (
-    '("ایران" OR "جنگ ایران" OR "آمریکا" OR '
-    '"حشد الشعبی" OR "حزب الله" OR "حماس" OR '
-    '"انصارالله" OR "حوثی" OR "غزه" OR "لبنان" OR "یمن") '
-    '(جنگ OR حمله OR حملات OR موشک OR موشکی OR پهپاد OR '
-    'درگیری OR آتش‌بس OR مذاکره OR عملیات OR اسرائیل OR آمریکا OR '
-    'نیروهای آمریکایی OR پایگاه OR دریای سرخ OR باب‌المندب OR هرمز)'
+TOPIC_KEYWORDS = [
+    "ایران",
+    "تهران",
+    "iran",
+    "tehran",
+
+    "عراق",
+    "حشد الشعبی",
+    "حشد",
+    "hashd",
+    "iraq",
+    "pmf",
+
+    "لبنان",
+    "حزب الله",
+    "حزب‌الله",
+    "hezbollah",
+    "lebanon",
+
+    "فلسطین",
+    "غزه",
+    "حماس",
+    "hamas",
+    "gaza",
+    "palestine",
+
+    "یمن",
+    "انصارالله",
+    "انصار الله",
+    "حوثی",
+    "حوثی‌ها",
+    "حوثی ها",
+    "houthis",
+    "houthi",
+    "ansarallah",
+    "ansar allah",
+    "yemen",
+
+    "آمریکا",
+    "امریکا",
+    "ایالات متحده",
+    "united states",
+    "israel",
+    "اسرائیل",
+    "usa",
+    "u.s.",
+    "iran-us",
+    "iran us",
+
+    "سوریه",
+    "syria",
+
+    "تنگه هرمز",
+    "hormuz",
+]
+
+
+URGENCY_KEYWORDS = [
+    "فوری",
+    "خبر فوری",
+    "breaking",
+    "urgent",
+
+    "حمله",
+    "حمله هوایی",
+    "حمله موشکی",
+    "موشک",
+    "موشکی",
+    "پهپاد",
+
+    "انفجار",
+    "انفجارها",
+
+    "درگیری",
+    "درگیری‌ها",
+    "درگیری ها",
+
+    "جنگ",
+
+    "آتش بس",
+    "آتش‌بس",
+
+    "تلفات",
+    "کشته",
+    "کشته شد",
+    "کشته شدند",
+    "زخمی",
+    "مجروح",
+
+    "عملیات",
+    "عملیات نظامی",
+
+    "رهگیری",
+    "پدافند",
+
+    "موشک‌باران",
+    "موشک باران",
+    "بمباران",
+
+    "حمله آمریکا",
+    "حمله اسرائیل",
+    "حمله ایران",
+
+    "ترور",
+    "هشدار",
+
+    "مذاکرات",
+    "توافق",
+
+    "تحریم",
+    "تحریم جدید",
+
+    "رزمایش",
+    "ناو",
+    "ناو هواپیمابر",
+
+    "مرز",
+    "بسته شدن",
+    "بستن",
+
+    "تحولات",
+]
+
+
+# =========================================================
+# OPENAI
+# =========================================================
+
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    timeout=OPENAI_TIMEOUT,
 )
 
 
-def build_rss_url(domain):
-    query = (
-        f"site:{domain} "
-        f"({RSS_TOPIC_QUERY})"
-    )
-
-    return (
-        "https://news.google.com/rss/search?q="
-        + quote_plus(query)
-        + "&hl=fa&gl=IR&ceid=IR:fa"
-    )
-
-
-# ============================================================
-# ابزارهای عمومی
-# ============================================================
+# =========================================================
+# TEXT HELPERS
+# =========================================================
 
 def clean(text):
-    text = re.sub(
-        r"<[^>]+>",
-        " ",
-        text or "",
-    )
-
+    text = re.sub(r"<[^>]+>", " ", text or "")
     text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
 
-    return re.sub(
-        r"\s+",
-        " ",
-        text,
-    ).strip()
 
+def normalize(text):
+    text = clean(text).lower()
+    text = text.replace("ي", "ی")
+    text = text.replace("ك", "ک")
+    return text
+
+
+# =========================================================
+# SENT LINKS
+# =========================================================
 
 def load_sent():
     if not os.path.exists(SENT_FILE):
         return set()
 
-    with open(
-        SENT_FILE,
-        encoding="utf-8",
-    ) as f:
-        return {
-            x.strip()
-            for x in f
-            if x.strip()
-        }
+    try:
+        with open(SENT_FILE, "r", encoding="utf-8") as f:
+            return {x.strip() for x in f if x.strip()}
+    except Exception as e:
+        print("Sent file error:", e)
+        return set()
 
 
 def save_sent(link):
-    with open(
-        SENT_FILE,
-        "a",
-        encoding="utf-8",
-    ) as f:
-        f.write(link + "\n")
+    try:
+        with open(SENT_FILE, "a", encoding="utf-8") as f:
+            f.write(link.strip() + "\n")
+    except Exception as e:
+        print("Save sent error:", e)
 
 
-def normalize_source(source):
-    source = clean(source).lower()
+# =========================================================
+# DATE
+# =========================================================
 
-    for key, value in SOURCE_ALIASES.items():
-        if key in source:
-            return value
-
-    return None
-
-
-def get_source_name(item):
-    source = item.find("source")
-
-    if source is not None:
-        name = (
-            source.text
-            or ""
-        )
-
-        normalized = normalize_source(name)
-
-        if normalized:
-            return normalized
-
-    # اگر source وجود نداشت، از URL کمک می‌گیریم
-    link = (
-        item.findtext("link")
-        or ""
-    ).lower()
-
-    for name, domain in SOURCES.items():
-        if domain in link:
-            return name
-
-    return None
-
-
-def get_pub_date(item):
+def parse_date(item):
     date_text = (
         item.findtext("pubDate")
+        or item.findtext(
+            "{http://purl.org/dc/elements/1.1/}date"
+        )
         or ""
-    ).strip()
+    )
 
     if not date_text:
-        return datetime.min.replace(
-            tzinfo=timezone.utc
-        )
+        return datetime.now(timezone.utc)
 
     try:
         from email.utils import parsedate_to_datetime
 
-        value = parsedate_to_datetime(
-            date_text
-        )
+        dt = parsedate_to_datetime(date_text)
 
-        if value.tzinfo is None:
-            value = value.replace(
-                tzinfo=timezone.utc
-            )
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
 
-        return value
+        return dt.astimezone(timezone.utc)
 
     except Exception:
-        return datetime.min.replace(
-            tzinfo=timezone.utc
-        )
+        return datetime.now(timezone.utc)
 
 
-# ============================================================
-# تشخیص اهمیت و ارتباط خبر
-# ============================================================
+# =========================================================
+# SOURCE CHECK
+# =========================================================
 
-def classify_news(
-    title,
-    description,
-    source,
-):
-    text = (
-        f"منبع: {source}\n"
-        f"عنوان: {clean(title)}\n"
-        f"توضیح: {clean(description)}"
+def source_info(item, link):
+    source_name = clean(
+        item.findtext("source") or ""
     )
 
-    instructions = """
-تو سردبیر یک کانال خبری فارسی هستی.
+    domain = ""
 
-فقط خبرهای مهم و مرتبط با این حوزه‌ها را انتخاب کن:
-
-1. ایران و جنگ یا درگیری مستقیم ایران و آمریکا
-2. حملات، پاسخ‌های نظامی، موشکی و پهپادی مرتبط با ایران
-3. حشد الشعبی عراق و تحولات مهم امنیتی مرتبط با آن
-4. حزب‌الله لبنان و تحولات مهم نظامی یا امنیتی لبنان
-5. حماس، غزه و تحولات مهم جنگ و مذاکرات مرتبط با آن
-6. انصارالله/حوثی‌های یمن
-7. دریای سرخ، باب‌المندب و تحولات نظامی مرتبط
-8. اسرائیل، فقط وقتی خبر مستقیماً به پرونده ایران،
-   جنگ منطقه، غزه، لبنان یا گروه‌های ذکرشده مربوط باشد.
-9. مذاکرات، آتش‌بس، تصمیم‌های مهم سیاسی یا نظامی
-   که مستقیماً به این پرونده‌ها مربوط باشند.
-
-خبرهای زیر را منتشر نکن:
-
-- فوتبال و ورزش
-- سینما و سرگرمی
-- اقتصاد عادی
-- قیمت‌ها و بازارهای عادی
-- حوادث عادی
-- اخبار اجتماعی عادی
-- اخبار فناوری عادی
-- اخبار ایران که ارتباطی با موضوعات بالا ندارند
-- تحلیل‌های کم‌اهمیت
-- خبرهای تکراری یا صرفاً حاشیه‌ای
-
-فقط یکی از این سه عبارت را برگردان:
-
-PUBLISH
-URGENT
-SKIP
-
-URGENT یعنی خبر بسیار تازه و مهم است و
-ماهیت فوری یا در حال وقوع دارد.
-
-هیچ توضیح دیگری ننویس.
-"""
-
-    try:
-        response = client.responses.create(
-            model="gpt-5.6-luna",
-            instructions=instructions,
-            input=text,
-        )
-
-        result = (
-            response.output_text
-            .strip()
-            .upper()
-        )
-
-        if result.startswith("URGENT"):
-            return "URGENT"
-
-        if result.startswith("PUBLISH"):
-            return "PUBLISH"
-
-    except Exception as e:
-        print(
-            "Classifier error:",
-            e,
-        )
-
-    return "SKIP"
-
-
-# ============================================================
-# خلاصه خبر
-# ============================================================
-
-def make_summary(
-    title,
-    description,
-):
-    source = (
-        f"عنوان خبر:\n"
-        f"{title}\n\n"
-        f"متن خبر:\n"
-        f"{clean(description)}"
+    match = re.search(
+        r"https?://([^/]+)",
+        link or "",
     )
 
-    try:
-        response = client.responses.create(
-            model="gpt-5.6-luna",
-            instructions=(
-                "تو سردبیر خبری فارسی‌زبان هستی. "
-                "خبر را در 2 تا 3 جمله کوتاه و دقیق خلاصه کن. "
-                "بی‌طرف باش و هیچ اطلاعاتی خارج از متن اضافه نکن. "
-                "فقط خلاصه را بنویس."
-            ),
-            input=source,
-        )
+    if match:
+        domain = match.group(1).lower()
 
-        result = (
-            response.output_text
-            .strip()
-        )
+        if domain.startswith("www."):
+            domain = domain[4:]
 
-        if result:
-            return result
+    return source_name, domain
 
-    except Exception as e:
-        print(
-            "Summary error:",
-            e,
-        )
+
+def is_allowed_source(item, link):
+    source_name, domain = source_info(
+        item,
+        link,
+    )
+
+    if domain in SOURCE_DOMAINS:
+        return True
+
+    source_lower = normalize(
+        source_name
+    )
+
+    for name in SOURCE_NAMES:
+        if normalize(name) in source_lower:
+            return True
+
+    return False
+
+
+# =========================================================
+# TOPIC FILTER
+# =========================================================
+
+def topic_score(text):
+    t = normalize(text)
+
+    return sum(
+        1
+        for keyword in TOPIC_KEYWORDS
+        if normalize(keyword) in t
+    )
+
+
+def urgency_score(text):
+    t = normalize(text)
+
+    return sum(
+        1
+        for keyword in URGENCY_KEYWORDS
+        if normalize(keyword) in t
+    )
+
+
+def is_relevant_news(title, description):
+    text = f"{title} {description}"
+
+    topics = topic_score(text)
+    urgency = urgency_score(text)
+
+    return topics >= 1 and urgency >= 1
+
+
+# =========================================================
+# RSS URL
+# =========================================================
+
+def build_rss_url():
+    topics = (
+        "ایران OR Iran OR "
+        "عراق OR Iraq OR حشد OR Hashd OR "
+        "لبنان OR Lebanon OR حزب الله OR Hezbollah OR "
+        "فلسطین OR Palestine OR غزه OR Gaza OR حماس OR Hamas OR "
+        "یمن OR Yemen OR انصارالله OR Houthis OR "
+        "آمریکا OR USA OR Israel OR اسرائیل OR "
+        "تنگه هرمز OR Hormuz"
+    )
+
+    sites = " OR ".join(
+        f"site:{domain}"
+        for domain in sorted(SOURCE_DOMAINS)
+    )
+
+    query = f"({topics}) ({sites})"
 
     return (
-        clean(description)[:500]
-        or title
+        "https://news.google.com/rss/search?"
+        f"q={quote_plus(query)}"
+        "&hl=fa"
+        "&gl=IR"
+        "&ceid=IR:fa"
     )
 
 
-# ============================================================
-# پیدا کردن عکس
-# ============================================================
+# =========================================================
+# RSS
+# =========================================================
 
-def find_rss_image_urls(item):
-    candidates = []
+def fetch_rss():
+    url = build_rss_url()
 
+    print("Fetching RSS...")
+
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=RSS_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    root = ET.fromstring(
+        response.content
+    )
+
+    return root.findall(
+        "./channel/item"
+    )
+
+
+# =========================================================
+# IMAGE
+# =========================================================
+
+def find_image_url(item):
     for child in item:
         tag = child.tag.lower()
 
@@ -386,14 +472,10 @@ def find_rss_image_urls(item):
             tag.endswith("content")
             or tag.endswith("thumbnail")
         ):
-            url = child.attrib.get(
-                "url"
-            )
+            url = child.attrib.get("url")
 
             if url:
-                candidates.append(
-                    url
-                )
+                return html.unescape(url)
 
     enclosure = item.find(
         "enclosure"
@@ -405,14 +487,10 @@ def find_rss_image_urls(item):
         )
 
         if url:
-            candidates.append(
-                url
-            )
+            return html.unescape(url)
 
     description = (
-        item.findtext(
-            "description"
-        )
+        item.findtext("description")
         or ""
     )
 
@@ -423,186 +501,60 @@ def find_rss_image_urls(item):
     )
 
     if match:
-        candidates.append(
-            html.unescape(
-                match.group(1)
-            )
+        return html.unescape(
+            match.group(1)
         )
 
-    return candidates
+    return None
 
 
-def extract_meta_images(
-    page_text,
-    final_url,
-):
-    candidates = []
+def find_article_image(link):
+    if not link:
+        return None
 
-    patterns = [
-        r'<meta[^>]+property=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)',
-        r'<meta[^>]+content=["\']([^"\']+)[^>]+property=["\']og:image(?::secure_url)?["\']',
-        r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)',
-        r'<meta[^>]+content=["\']([^"\']+)[^>]+name=["\']twitter:image(?::src)?["\']',
-    ]
+    try:
+        response = requests.get(
+            link,
+            headers=HEADERS,
+            timeout=ARTICLE_TIMEOUT,
+        )
 
-    for pattern in patterns:
-        for match in re.finditer(
-            pattern,
-            page_text,
-            re.IGNORECASE,
-        ):
-            candidates.append(
-                urljoin(
-                    final_url,
+        response.raise_for_status()
+
+        text = response.text
+
+        patterns = [
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+            r'<meta[^>]+content=["\']([^"\']+)[^>]+property=["\']og:image',
+            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)',
+            r'<meta[^>]+content=["\']([^"\']+)[^>]+name=["\']twitter:image',
+        ]
+
+        for pattern in patterns:
+            match = re.search(
+                pattern,
+                text,
+                re.IGNORECASE,
+            )
+
+            if match:
+                return urljoin(
+                    response.url,
                     html.unescape(
                         match.group(1)
                     ),
                 )
-            )
 
-    # JSON-LD
-    blocks = re.findall(
-        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        page_text,
-        re.IGNORECASE | re.DOTALL,
-    )
-
-    for block in blocks:
-        try:
-            data = json.loads(
-                html.unescape(block)
-            )
-
-            def collect_images(obj):
-                found = []
-
-                if isinstance(
-                    obj,
-                    dict,
-                ):
-                    image = obj.get(
-                        "image"
-                    )
-
-                    if isinstance(
-                        image,
-                        str,
-                    ):
-                        found.append(
-                            image
-                        )
-
-                    elif isinstance(
-                        image,
-                        dict,
-                    ):
-                        url = (
-                            image.get("url")
-                            or image.get(
-                                "contentUrl"
-                            )
-                        )
-
-                        if url:
-                            found.append(
-                                url
-                            )
-
-                    elif isinstance(
-                        image,
-                        list,
-                    ):
-                        for value in image:
-                            if isinstance(
-                                value,
-                                str,
-                            ):
-                                found.append(
-                                    value
-                                )
-
-                            elif isinstance(
-                                value,
-                                dict,
-                            ):
-                                url = (
-                                    value.get(
-                                        "url"
-                                    )
-                                    or value.get(
-                                        "contentUrl"
-                                    )
-                                )
-
-                                if url:
-                                    found.append(
-                                        url
-                                    )
-
-                    for value in obj.values():
-                        found.extend(
-                            collect_images(
-                                value
-                            )
-                        )
-
-                elif isinstance(
-                    obj,
-                    list,
-                ):
-                    for value in obj:
-                        found.extend(
-                            collect_images(
-                                value
-                            )
-                        )
-
-                return found
-
-            for image_url in collect_images(
-                data
-            ):
-                candidates.append(
-                    urljoin(
-                        final_url,
-                        image_url,
-                    )
-                )
-
-        except Exception:
-            pass
-
-    # تصاویر داخل صفحه
-    for match in re.finditer(
-        r'<img\b[^>]*(?:src|data-src|data-original)=["\']([^"\']+)',
-        page_text,
-        re.IGNORECASE,
-    ):
-        candidates.append(
-            urljoin(
-                final_url,
-                html.unescape(
-                    match.group(1)
-                ),
-            )
+    except Exception as e:
+        print(
+            "Article image error:",
+            type(e).__name__,
         )
 
-    unique = []
-    seen = set()
-
-    for url in candidates:
-        if url and url not in seen:
-            seen.add(url)
-            unique.append(url)
-
-    return unique
+    return None
 
 
-def download_image(
-    url,
-    minimum_width=500,
-    minimum_height=300,
-):
+def download_image(url):
     if not url:
         return None
 
@@ -610,48 +562,18 @@ def download_image(
         response = requests.get(
             url,
             headers=HEADERS,
-            timeout=20,
+            timeout=IMAGE_TIMEOUT,
         )
 
         response.raise_for_status()
 
-        content_type = (
-            response.headers
-            .get(
-                "content-type",
-                "",
-            )
-            .lower()
-        )
-
-        if (
-            content_type
-            and not content_type.startswith(
-                "image/"
-            )
-        ):
-            return None
-
         image = Image.open(
-            BytesIO(
-                response.content
-            )
+            BytesIO(response.content)
         ).convert("RGBA")
 
         if (
-            image.width < minimum_width
-            or image.height < minimum_height
-        ):
-            return None
-
-        ratio = (
-            image.width /
-            image.height
-        )
-
-        if (
-            ratio < 0.35
-            or ratio > 3.2
+            image.width < 250
+            or image.height < 150
         ):
             return None
 
@@ -659,109 +581,20 @@ def download_image(
 
     except Exception as e:
         print(
-            "Image error:",
-            e,
+            "Image download error:",
+            type(e).__name__,
         )
 
     return None
 
-
-def find_article_image(link):
-    try:
-        response = requests.get(
-            link,
-            headers=HEADERS,
-            timeout=25,
-            allow_redirects=True,
-        )
-
-        response.raise_for_status()
-
-        candidates = extract_meta_images(
-            response.text,
-            response.url,
-        )
-
-        for image_url in candidates:
-            image = download_image(
-                image_url
-            )
-
-            if image is not None:
-                print(
-                    "Article image selected:",
-                    image_url,
-                )
-
-                return image
-
-    except Exception as e:
-        print(
-            "Article image error:",
-            e,
-        )
-
-    return None
-
-
-def prepare_image(
-    item,
-    link,
-):
-    # 1. عکس اصلی خود منبع
-    image = find_article_image(
-        link
-    )
-
-    if image is not None:
-        return image
-
-    # 2. عکس RSS
-    for image_url in find_rss_image_urls(
-        item
-    ):
-        image = download_image(
-            image_url
-        )
-
-        if image is not None:
-            print(
-                "RSS image selected:",
-                image_url,
-            )
-
-            return image
-
-    # 3. عکس پیش‌فرض خودمان
-    if os.path.exists(
-        FALLBACK_FILE
-    ):
-        try:
-            image = Image.open(
-                FALLBACK_FILE
-            ).convert("RGBA")
-
-            print(
-                "Fallback image selected."
-            )
-
-            return image
-
-        except Exception as e:
-            print(
-                "Fallback error:",
-                e,
-            )
-
-    return create_fallback()
-
-
-# ============================================================
-# لوگو و ظاهر تصویر
-# ============================================================
 
 def load_logo():
     try:
+        if not os.path.exists(
+            LOGO_FILE
+        ):
+            return None
+
         return Image.open(
             LOGO_FILE
         ).convert("RGBA")
@@ -775,38 +608,70 @@ def load_logo():
     return None
 
 
-def get_font(size):
+def load_fallback():
     try:
-        return ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            size,
+        if not os.path.exists(
+            FALLBACK_FILE
+        ):
+            print(
+                "Fallback file not found."
+            )
+            return None
+
+        return Image.open(
+            FALLBACK_FILE
+        ).convert("RGBA")
+
+    except Exception as e:
+        print(
+            "Fallback error:",
+            e,
         )
 
-    except Exception:
-        return ImageFont.load_default()
+    return None
 
+
+# =========================================================
+# FONT
+# =========================================================
+
+def get_font(size):
+    paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    ]
+
+    for path in paths:
+        try:
+            return ImageFont.truetype(
+                path,
+                size,
+            )
+        except Exception:
+            pass
+
+    return ImageFont.load_default()
+
+
+# =========================================================
+# BRANDING
+# =========================================================
 
 def add_branding(image):
     image = image.convert("RGBA")
 
-    draw = ImageDraw.Draw(
-        image
-    )
+    draw = ImageDraw.Draw(image)
 
     logo = load_logo()
 
     margin = max(
         18,
-        int(
-            image.width * 0.025
-        ),
+        int(image.width * 0.025),
     )
 
     panel_height = max(
         105,
-        int(
-            image.height * 0.16
-        ),
+        int(image.height * 0.16),
     )
 
     panel = Image.new(
@@ -815,20 +680,14 @@ def add_branding(image):
             image.width,
             panel_height,
         ),
-        (
-            0,
-            0,
-            0,
-            155,
-        ),
+        (0, 0, 0, 155),
     )
 
     image.alpha_composite(
         panel,
         (
             0,
-            image.height
-            - panel_height,
+            image.height - panel_height,
         ),
     )
 
@@ -838,19 +697,17 @@ def add_branding(image):
         )
 
         ratio = (
-            max_logo_width /
-            logo.width
+            max_logo_width
+            / logo.width
         )
 
         logo = logo.resize(
             (
                 int(
-                    logo.width *
-                    ratio
+                    logo.width * ratio
                 ),
                 int(
-                    logo.height *
-                    ratio
+                    logo.height * ratio
                 ),
             ),
             Image.LANCZOS,
@@ -861,24 +718,19 @@ def add_branding(image):
             - margin * 2
         )
 
-        if (
-            logo.height
-            > max_logo_height
-        ):
+        if logo.height > max_logo_height:
             ratio = (
-                max_logo_height /
-                logo.height
+                max_logo_height
+                / logo.height
             )
 
             logo = logo.resize(
                 (
                     int(
-                        logo.width *
-                        ratio
+                        logo.width * ratio
                     ),
                     int(
-                        logo.height *
-                        ratio
+                        logo.height * ratio
                     ),
                 ),
                 Image.LANCZOS,
@@ -908,8 +760,7 @@ def add_branding(image):
         max(
             24,
             int(
-                image.width
-                * 0.026
+                image.width * 0.026
             ),
         )
     )
@@ -946,10 +797,8 @@ def add_branding(image):
 
     draw.rounded_rectangle(
         (
-            text_x
-            - padding_x,
-            text_y
-            - padding_y,
+            text_x - padding_x,
+            text_y - padding_y,
             text_x
             + text_width
             + padding_x,
@@ -958,12 +807,7 @@ def add_branding(image):
             + padding_y,
         ),
         radius=14,
-        fill=(
-            0,
-            0,
-            0,
-            175,
-        ),
+        fill=(0, 0, 0, 175),
     )
 
     draw.text(
@@ -979,54 +823,131 @@ def add_branding(image):
     return image
 
 
-def create_fallback():
-    width = 1280
-    height = 720
-
-    image = Image.new(
-        "RGBA",
-        (
-            width,
-            height,
-        ),
-        (
-            25,
-            31,
-            42,
-            255,
-        ),
+def prepare_image(item, link):
+    # 1. RSS image
+    image = download_image(
+        find_image_url(item)
     )
 
-    draw = ImageDraw.Draw(
+    if image is not None:
+        print(
+            "Using RSS image."
+        )
+        return add_branding(
+            image
+        )
+
+    # 2. Article image
+    article_image_url = (
+        find_article_image(link)
+    )
+
+    image = download_image(
+        article_image_url
+    )
+
+    if image is not None:
+        print(
+            "Using article image."
+        )
+        return add_branding(
+            image
+        )
+
+    # 3. Fallback image
+    image = load_fallback()
+
+    if image is not None:
+        print(
+            "Using fallback image."
+        )
+        return add_branding(
+            image
+        )
+
+    # 4. Last resort
+    image = Image.new(
+        "RGBA",
+        (1280, 720),
+        (30, 35, 45, 255),
+    )
+
+    return add_branding(
         image
     )
 
-    font = get_font(42)
 
-    draw.text(
-        (
-            width // 2,
-            height // 2,
-        ),
-        "جهان‌تاب",
-        font=font,
-        fill="white",
-        anchor="mm",
+# =========================================================
+# SUMMARY
+# =========================================================
+
+def make_summary(title, description):
+    description = clean(
+        description
     )
 
-    return image
+    if not description:
+        description = title
+
+    source = (
+        f"عنوان خبر:\n"
+        f"{title}\n\n"
+        f"متن خبر:\n"
+        f"{description[:6000]}"
+    )
+
+    try:
+        print(
+            "Calling OpenAI..."
+        )
+
+        response = client.responses.create(
+            model="gpt-5.6-luna",
+            instructions=(
+                "تو یک سردبیر خبری فارسی‌زبان هستی. "
+                "خبر را فقط بر اساس اطلاعات متن منبع "
+                "در 2 تا 3 جمله کوتاه و دقیق خلاصه کن. "
+                "بی‌طرف و factual باش. "
+                "هیچ اطلاعات یا تحلیل خارج از متن اضافه نکن. "
+                "از زبان تبلیغاتی یا احساسی استفاده نکن. "
+                "فقط خلاصه فارسی را بنویس."
+            ),
+            input=source,
+        )
+
+        result = (
+            response.output_text
+            or ""
+        ).strip()
+
+        if result:
+            return result
+
+    except Exception as e:
+        print(
+            "OpenAI error:",
+            type(e).__name__,
+            str(e)[:200],
+        )
+
+    print(
+        "Using source text as fallback."
+    )
+
+    return (
+        description[:700]
+        or title
+    )
 
 
-# ============================================================
-# کپشن تلگرام
-# ============================================================
+# =========================================================
+# TELEGRAM
+# =========================================================
 
 def make_caption(
     title,
     summary,
     link,
-    status,
-    source,
 ):
     title = html.escape(
         title
@@ -1041,25 +962,12 @@ def make_caption(
         quote=True,
     )
 
-    source = html.escape(
-        source
-    )
-
-    prefix = ""
-
-    if status == "URGENT":
-        prefix = (
-            "🚨 <b>خبر فوری</b>\n\n"
-        )
-
     caption = (
-        f"{prefix}"
-        f"📰 <b>{title}</b>\n\n"
-        f"📡 <b>منبع:</b> {source}\n\n"
+        f"<b>{title}</b>\n\n"
         f"📝 <b>خلاصه خبر</b>\n"
         f"{summary}\n\n"
         f'🔗 <a href="{link}">'
-        f"مشاهده خبر اصلی"
+        f"خبر اصلی"
         f"</a>"
     )
 
@@ -1067,20 +975,16 @@ def make_caption(
         return caption
 
     fixed = (
-        f"{prefix}"
-        f"📰 <b>{title}</b>\n\n"
-        f"📡 <b>منبع:</b> {source}\n\n"
+        f"<b>{title}</b>\n\n"
         f"📝 <b>خلاصه خبر</b>\n\n"
         f'🔗 <a href="{link}">'
-        f"مشاهده خبر اصلی"
+        f"خبر اصلی"
         f"</a>"
     )
 
     available = max(
         100,
-        1024
-        - len(fixed)
-        - 10,
+        1024 - len(fixed) - 10,
     )
 
     summary = (
@@ -1089,13 +993,11 @@ def make_caption(
     )
 
     return (
-        f"{prefix}"
-        f"📰 <b>{title}</b>\n\n"
-        f"📡 <b>منبع:</b> {source}\n\n"
+        f"<b>{title}</b>\n\n"
         f"📝 <b>خلاصه خبر</b>\n"
         f"{summary}\n\n"
         f'🔗 <a href="{link}">'
-        f"مشاهده خبر اصلی"
+        f"خبر اصلی"
         f"</a>"
     )
 
@@ -1105,8 +1007,6 @@ def send_photo(
     title,
     summary,
     link,
-    status,
-    source,
 ):
     buffer = BytesIO()
 
@@ -1115,22 +1015,25 @@ def send_photo(
     ).save(
         buffer,
         "JPEG",
-        quality=92,
+        quality=90,
         optimize=True,
     )
 
     buffer.seek(0)
 
+    print(
+        "Sending to Telegram..."
+    )
+
     response = requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/sendPhoto",
         data={
             "chat_id": CHANNEL,
             "caption": make_caption(
                 title,
                 summary,
                 link,
-                status,
-                source,
             ),
             "parse_mode": "HTML",
         },
@@ -1139,189 +1042,236 @@ def send_photo(
                 "jahantab_news.jpg",
                 buffer,
                 "image/jpeg",
-            ),
+            )
         },
-        timeout=40,
+        timeout=TELEGRAM_TIMEOUT,
     )
 
     print(
-        "Telegram:",
+        "Telegram status:",
         response.status_code,
-        response.text[:300],
     )
 
     response.raise_for_status()
 
 
-# ============================================================
-# دریافت خبرها
-# ============================================================
+# =========================================================
+# SELECT NEWS
+# =========================================================
 
-def fetch_source_items():
-    all_items = []
-
-    for source_name, domain in SOURCES.items():
-        rss_url = build_rss_url(
-            domain
-        )
-
-        print(
-            "Fetching:",
-            source_name,
-        )
-
-        try:
-            response = requests.get(
-                rss_url,
-                headers=HEADERS,
-                timeout=30,
-            )
-
-            response.raise_for_status()
-
-            root = ET.fromstring(
-                response.text
-            )
-
-            items = root.findall(
-                "./channel/item"
-            )
-
-            for item in items:
-                actual_source = get_source_name(
-                    item
-                )
-
-                # فقط منبع‌های مجاز
-                if not actual_source:
-                    continue
-
-                if actual_source != source_name:
-                    continue
-
-                all_items.append(
-                    item
-                )
-
-        except Exception as e:
-            print(
-                "RSS error:",
-                source_name,
-                e,
-            )
-
-    # جدیدترین‌ها اول
-    all_items.sort(
-        key=get_pub_date,
-        reverse=True,
+def select_news(
+    items,
+    sent,
+):
+    now = datetime.now(
+        timezone.utc
     )
 
-    return all_items
-
-
-# ============================================================
-# اجرای اصلی
-# ============================================================
-
-def main():
-    print(
-        "Starting Telegram News Bot..."
-    )
-
-    items = fetch_source_items()
-
-    print(
-        "Allowed-source items:",
-        len(items),
-    )
-
-    sent = load_sent()
+    candidates = []
 
     for item in items:
-        title = (
-            item.findtext("title")
+        title = clean(
+            item.findtext(
+                "title"
+            )
             or ""
-        ).strip()
+        )
 
-        link = (
-            item.findtext("link")
+        link = clean(
+            item.findtext(
+                "link"
+            )
             or ""
-        ).strip()
+        )
 
-        description = (
+        description = clean(
             item.findtext(
                 "description"
             )
             or ""
         )
 
-        source = get_source_name(
-            item
-        )
-
-        if (
-            not title
-            or not link
-            or not source
-        ):
+        if not title or not link:
             continue
 
         if link in sent:
             continue
 
-        print(
-            "Checking:",
-            source,
-            "|",
-            title,
-        )
-
-        status = classify_news(
-            title,
-            description,
-            source,
-        )
-
-        print(
-            "Classification:",
-            status,
-        )
-
-        if status == "SKIP":
-            continue
-
-        summary = make_summary(
-            title,
-            description,
-        )
-
-        image = prepare_image(
+        if not is_allowed_source(
             item,
             link,
+        ):
+            continue
+
+        pub_date = parse_date(
+            item
         )
 
-        image = add_branding(
-            image
-        )
+        age = now - pub_date
 
-        send_photo(
-            image,
+        if age > timedelta(
+            hours=MAX_AGE_HOURS
+        ):
+            continue
+
+        if age < timedelta(
+            minutes=-10
+        ):
+            continue
+
+        if not is_relevant_news(
             title,
-            summary,
-            link,
-            status,
-            source,
+            description,
+        ):
+            continue
+
+        candidates.append(
+            {
+                "item": item,
+                "title": title,
+                "link": link,
+                "description": description,
+                "date": pub_date,
+            }
         )
 
-        save_sent(link)
+    candidates.sort(
+        key=lambda x: x["date"],
+        reverse=True,
+    )
 
+    return candidates
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+    print("=" * 60)
+    print(
+        "JAHANTAB TELEGRAM NEWS BOT"
+    )
+    print("Starting...")
+    print("=" * 60)
+
+    sent = load_sent()
+
+    print(
+        "Already sent:",
+        len(sent),
+    )
+
+    try:
+        items = fetch_rss()
+
+    except Exception as e:
         print(
-            "Published successfully:",
-            source,
-            title,
+            "RSS ERROR:",
+            type(e).__name__,
+            str(e)[:300],
+        )
+        print(
+            "Bot finished safely."
+        )
+        return
+
+    print(
+        "RSS items:",
+        len(items),
+    )
+
+    candidates = select_news(
+        items,
+        sent,
+    )
+
+    print(
+        "Matching new news:",
+        len(candidates),
+    )
+
+    if not candidates:
+        print(
+            "No new relevant news found."
+        )
+        print(
+            "Bot finished safely."
+        )
+        return
+
+    selected = candidates[
+        :MAX_POSTS_PER_RUN
+    ]
+
+    for news in selected:
+        title = news["title"]
+        link = news["link"]
+        description = news[
+            "description"
+        ]
+
+        source_name, domain = (
+            source_info(
+                news["item"],
+                link,
+            )
         )
 
-        break
+        print("-" * 60)
+        print(
+            "Selected news:",
+            title,
+        )
+        print(
+            "Source:",
+            source_name,
+        )
+        print(
+            "Domain:",
+            domain,
+        )
+        print(
+            "Link:",
+            link,
+        )
+
+        try:
+            summary = make_summary(
+                title,
+                description,
+            )
+
+            image = prepare_image(
+                news["item"],
+                link,
+            )
+
+            send_photo(
+                image,
+                title,
+                summary,
+                link,
+            )
+
+            save_sent(link)
+
+            print(
+                "Published successfully."
+            )
+
+        except Exception as e:
+            print(
+                "PUBLISH ERROR:",
+                type(e).__name__,
+                str(e)[:300],
+            )
+
+    print("=" * 60)
+    print(
+        "BOT FINISHED"
+    )
+    print("=" * 60)
 
 
 if __name__ == "__main__":
