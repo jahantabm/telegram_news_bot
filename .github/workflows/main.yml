@@ -5,12 +5,17 @@ on:
   schedule:
     - cron: "*/5 * * * *"
 
+concurrency:
+  group: telegram-news-bot
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
       - name: Get code
@@ -22,7 +27,9 @@ jobs:
           python-version: "3.x"
 
       - name: Install dependencies
-        run: pip install requests openai pillow
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests openai pillow
 
       - name: Run bot
         env:
@@ -39,8 +46,8 @@ jobs:
           git add sent_links.txt
 
           if git diff --cached --quiet; then
-            echo "No new sent links to save."
+            echo "No changes to sent_links.txt"
           else
-            git commit -m "Update sent news links"
+            git commit -m "Update sent links"
             git push
           fi
