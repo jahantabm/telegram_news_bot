@@ -59,7 +59,7 @@ BAD = [
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; JAHANTAB-News-Bot/1.0)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
 
 
@@ -92,7 +92,7 @@ def source_name(url):
     return None
 
 
-def is_relevant(title):
+def relevant(title):
     t = title.lower()
 
     if any(x in t for x in BAD):
@@ -115,11 +115,11 @@ def fetch_rss(query):
             r = requests.get(
                 url,
                 headers=HEADERS,
-                timeout=(5, 10)
+                timeout=(5, 12)
             )
 
             if r.status_code == 503:
-                print("Google RSS 503 - retrying...")
+                print("Google RSS 503 - retry...")
                 time.sleep(3 + attempt * 2)
                 continue
 
@@ -140,7 +140,7 @@ def parse_rss(data):
     try:
         root = ET.fromstring(data)
     except Exception as e:
-        print("RSS PARSE ERROR:", str(e))
+        print("XML ERROR:", str(e))
         return []
 
     results = []
@@ -156,19 +156,19 @@ def parse_rss(data):
         source = source_name(link)
 
         if not source:
-            src = item.find("source")
-            if src is not None and src.text:
-                source = clean(src.text)
+            node = item.find("source")
+            if node is not None:
+                source = clean(node.text)
 
         if not source:
             continue
 
-        if not is_relevant(title):
+        if not relevant(title):
             continue
 
         results.append({
             "title": title,
-            "link": link,
+            "google_url": link,
             "desc": desc,
             "source": source
         })
@@ -176,54 +176,84 @@ def parse_rss(data):
     return results
 
 
-def find_news(sent):
-    all_news = []
+def resolve_url(google_url):
+    try:
+        print("Resolving Google News link...")
 
-    for query in QUERIES:
-        data = fetch_rss(query)
+        r = requests.get(
+            google_url,
+            headers=HEADERS,
+            timeout=(5, 12),
+            allow_redirects=True
+        )
 
-        if data:
-            all_news.extend(parse_rss(data))
+        final = r.url
 
-        if len(all_news) >= 10:
-            break
+        print("Resolved URL:", final)
 
-    unique = []
-    seen = set()
+        if "news.google.com" not in final:
+            return final
 
-    for item in all_news:
-        link = item["link"]
+    except Exception as e:
+        print("URL RESOLVE ERROR:", str(e))
 
-        if link in seen or link in sent:
-            continue
-
-        seen.add(link)
-        unique.append(item)
-
-    return unique
+    return google_url
 
 
-def find_image(url):
+def get_article(url):
     try:
         r = requests.get(
             url,
             headers=HEADERS,
-            timeout=(4, 7)
+            timeout=(5, 10),
+            allow_redirects=True
         )
+
+        text = r.text
+
+        title = None
+        description = None
+        image = None
+
+        m = re.search(
+            r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+            text,
+            re.I
+        )
+        if m:
+            title = clean(m.group(1))
+
+        m = re.search(
+            r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)',
+            text,
+            re.I
+        )
+        if m:
+            description = clean(m.group(1))
 
         m = re.search(
             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
-            r.text,
+            text,
             re.I
         )
-
         if m:
-            return html.unescape(m.group(1))
+            image = html.unescape(m.group(1))
 
-    except Exception:
-        pass
+        return {
+            "url": r.url,
+            "title": title,
+            "description": description,
+            "image": image
+        }
 
-    return None
+    except Exception as e:
+        print("ARTICLE ERROR:", str(e))
+        return {
+            "url": url,
+            "title": None,
+            "description": None,
+            "image": None
+        }
 
 
 def make_image(image_url):
@@ -232,7 +262,7 @@ def make_image(image_url):
             r = requests.get(
                 image_url,
                 headers=HEADERS,
-                timeout=(4, 8)
+                timeout=(5, 10)
             )
 
             img = Image.open(
@@ -242,6 +272,7 @@ def make_image(image_url):
             raise ValueError("No image")
 
     except Exception:
+        print("Using fallback image.")
         img = Image.open(FALLBACK).convert("RGB")
 
     img.thumbnail((1200, 1200))
@@ -261,15 +292,17 @@ def make_image(image_url):
         try:
             logo = Image.open(LOGO).convert("RGBA")
             logo.thumbnail((280, 280))
+
             canvas.paste(
                 logo,
                 (30, 30),
                 logo
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print("Logo error:", str(e))
 
     draw = ImageDraw.Draw(canvas)
+
     draw.text(
         (35, 1235),
         CHANNEL,
@@ -277,6 +310,7 @@ def make_image(image_url):
     )
 
     out = BytesIO()
+
     canvas.save(
         out,
         format="JPEG",
@@ -284,12 +318,13 @@ def make_image(image_url):
     )
 
     out.seek(0)
+
     return out
 
 
-def summarize(title, desc, source):
+def make_persian_news(title, description, source):
     if not OPENAI_KEY:
-        return desc[:900]
+        return title, description
 
     try:
         client = OpenAI(
@@ -298,18 +333,30 @@ def summarize(title, desc, source):
         )
 
         prompt = f"""
-این خبر را به فارسی کوتاه و دقیق خلاصه کن.
+یک خبر را برای انتشار در کانال خبری فارسی آماده کن.
+
+خروجی فقط شامل دو بخش باشد:
+
+TITLE:
+یک عنوان فارسی کوتاه و دقیق.
+
+SUMMARY:
+یک خلاصه فارسی 3 تا 4 جمله‌ای.
 
 قوانین:
-- کاملاً بی‌طرف باش.
-- فقط اطلاعات موجود در خبر را بیان کن.
-- هیچ شعار، تبلیغ، تحلیل شخصی یا پیش‌بینی اضافه نکن.
-- حداکثر 4 جمله.
-- نام اشخاص، کشورها و سازمان‌ها را دقیق نگه دار.
+- کاملاً بی‌طرف و خبری باش.
+- هیچ شعار، تبلیغ یا نظر شخصی اضافه نکن.
+- اطلاعاتی که در متن نیست اختراع نکن.
+- نام کشورها، سازمان‌ها و افراد را دقیق ترجمه کن.
+- متن انگلیسی را تکرار نکن.
 
 منبع: {source}
-عنوان: {title}
-متن: {desc}
+
+عنوان اصلی:
+{title}
+
+توضیحات خبر:
+{description}
 """
 
         result = client.responses.create(
@@ -317,14 +364,32 @@ def summarize(title, desc, source):
             input=prompt
         )
 
-        return result.output_text.strip()[:1800]
+        text = result.output_text.strip()
+
+        m1 = re.search(
+            r"TITLE:\s*(.*?)(?:\n|$)",
+            text,
+            re.I
+        )
+
+        m2 = re.search(
+            r"SUMMARY:\s*(.*)",
+            text,
+            re.I | re.S
+        )
+
+        fa_title = m1.group(1).strip() if m1 else title
+        summary = m2.group(1).strip() if m2 else text
+
+        return fa_title, summary[:1800]
 
     except Exception as e:
         print("OPENAI ERROR:", str(e))
-        return desc[:900]
+
+        return title, description[:900]
 
 
-def send_to_telegram(photo, caption):
+def send(photo, caption):
     url = (
         f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
     )
@@ -355,57 +420,97 @@ def main():
     print("=" * 60)
 
     if not TOKEN:
-        print("ERROR: BOT_TOKEN missing")
+        print("BOT_TOKEN missing")
         return
 
     sent = get_sent()
 
     print("Already sent:", len(sent))
 
-    news = find_news(sent)
+    news = []
 
-    if not news:
+    for query in QUERIES:
+        data = fetch_rss(query)
+
+        if data:
+            news.extend(parse_rss(data))
+
+        if len(news) >= 10:
+            break
+
+    unique = []
+    seen = set()
+
+    for item in news:
+        if item["google_url"] in seen:
+            continue
+
+        if item["google_url"] in sent:
+            continue
+
+        seen.add(item["google_url"])
+        unique.append(item)
+
+    if not unique:
         print("No new relevant news.")
         return
 
-    item = news[0]
+    item = unique[0]
 
-    title = item["title"]
-    link = item["link"]
-    desc = item["desc"]
+    google_url = item["google_url"]
     source = item["source"]
 
-    print("Selected:", title)
+    print("Selected:", item["title"])
     print("Source:", source)
 
-    image_url = find_image(link)
+    real_url = resolve_url(google_url)
 
-    if image_url:
-        print("Article image found.")
-    else:
-        print("Using fallback image.")
+    article = get_article(real_url)
 
-    photo = make_image(image_url)
+    final_url = article["url"]
 
-    summary = summarize(
-        title,
-        desc,
+    if "news.google.com" in final_url:
+        print("Direct URL unavailable; keeping Google URL.")
+        final_url = google_url
+
+    original_title = (
+        article["title"]
+        or item["title"]
+    )
+
+    description = (
+        article["description"]
+        or item["desc"]
+        or original_title
+    )
+
+    print("Final URL:", final_url)
+
+    fa_title, summary = make_persian_news(
+        original_title,
+        description,
         source
     )
 
+    print("Persian title:", fa_title)
+
+    photo = make_image(
+        article["image"]
+    )
+
     caption = (
-        f"📰 {title}\n\n"
+        f"📰 {fa_title}\n\n"
         f"{summary}\n\n"
         f"منبع: {source}\n"
-        f"🔗 {link}"
+        f"🔗 {final_url}"
     )
 
-    send_to_telegram(
-        photo,
-        caption
-    )
+    send(photo, caption)
 
-    save_sent(link)
+    save_sent(google_url)
+
+    if final_url != google_url:
+        save_sent(final_url)
 
     print("Sent successfully.")
     print("=" * 60)
