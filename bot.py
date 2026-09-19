@@ -1,9 +1,10 @@
 import os
 import re
 import html
+import json
 import xml.etree.ElementTree as ET
 from io import BytesIO
-from urllib.parse import urljoin
+from urllib.parse import quote_plus, urljoin
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -14,20 +15,36 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL = os.environ["CHANNEL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
-RSS_URL = (
-    "https://news.google.com/rss/search?"
-    "q=%D8%A7%DB%8C%D8%B1%D8%A7%D9%86+OR+%D8%B9%D8%B1%D8%A7%D9%82+OR+%D8%B3%D9%88%D8%B1%D9%8A%D9%87+"
-    "OR+%D9%84%D8%A8%D9%86%D8%A7%D9%86+OR+%D8%BA%D8%B2%D9%87&hl=fa&gl=IR&ceid=IR:fa"
+
+# موضوعات خبری موردنظر
+RSS_QUERY = (
+    '("ایران" OR "حشد الشعبی" OR "حزب الله" OR "حماس" OR '
+    '"انصارالله" OR "حوثی" OR "غزه" OR "لبنان" OR "یمن") '
+    '(جنگ OR حمله OR موشک OR پهپاد OR درگیری OR آتش‌بس OR مذاکره OR '
+    'آمریکا OR اسرائیل OR عملیات OR حملات)'
 )
 
+RSS_URL = (
+    "https://news.google.com/rss/search?q="
+    + quote_plus(RSS_QUERY)
+    + "&hl=fa&gl=IR&ceid=IR:fa"
+)
+
+
 LOGO_FILE = "jahantab_logo_transparent-1.png"
+FALLBACK_FILE = "fallback_news.jpg"
 SENT_FILE = "sent_links.txt"
 CHANNEL_TEXT = "@jahantab_news"
 
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 Chrome/120 Safari/537.36"
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+    )
 }
 
 
@@ -50,6 +67,69 @@ def save_sent(link):
         f.write(link + "\n")
 
 
+def classify_news(title, description):
+    text = (
+        f"عنوان: {clean(title)}\n"
+        f"توضیح: {clean(description)}"
+    )
+
+    instructions = """
+تو یک سردبیر خبر فارسی هستی که فقط وظیفه‌ات تشخیص ارتباط و اهمیت خبر است.
+
+موضوعات موردنظر:
+
+- ایران و تحولات مستقیم جنگ یا درگیری ایران و آمریکا
+- حملات، پاسخ‌های نظامی، موشکی و پهپادی مرتبط با ایران و منطقه
+- حشد الشعبی عراق و تحولات امنیتی مهم مرتبط با آن
+- حزب‌الله لبنان و تحولات مهم مرتبط با درگیری لبنان
+- حماس و جنگ و تحولات مهم غزه و فلسطین
+- انصارالله/حوثی‌ها و تحولات مهم یمن، دریای سرخ و باب‌المندب
+- تحولات مهم دیپلماتیک، آتش‌بس یا مذاکرات مستقیم مرتبط با این پرونده‌ها
+
+خبر فقط وقتی قابل انتشار است که:
+
+1. به یکی از موضوعات بالا ارتباط مستقیم داشته باشد.
+2. یک تحول خبری قابل‌توجه داشته باشد؛
+   مثل حمله، پاسخ، درگیری مهم، تصمیم مهم دولتی یا نظامی،
+   مذاکره مهم، آتش‌بس یا تحول امنیتی جدی.
+
+خبرهای ورزشی، سرگرمی، اقتصادی عادی، اجتماعی عادی
+و خبرهای عمومی ایران که ارتباط مستقیمی با موضوعات بالا ندارند
+باید حذف شوند.
+
+فقط یکی از این سه کلمه را برگردان:
+
+PUBLISH
+SKIP
+URGENT
+
+URGENT فقط وقتی است که خبر طبق متن ارائه‌شده
+ماهیت فوری، در حال وقوع یا بسیار تازه داشته باشد.
+
+هیچ توضیح دیگری ننویس.
+"""
+
+    try:
+        response = client.responses.create(
+            model="gpt-5.6-luna",
+            instructions=instructions,
+            input=text,
+        )
+
+        result = response.output_text.strip().upper()
+
+        if result.startswith("URGENT"):
+            return "URGENT"
+
+        if result.startswith("PUBLISH"):
+            return "PUBLISH"
+
+    except Exception as e:
+        print("Classifier error:", e)
+
+    return "SKIP"
+
+
 def make_summary(title, description):
     source = (
         f"عنوان خبر:\n{title}\n\n"
@@ -57,29 +137,31 @@ def make_summary(title, description):
     )
 
     try:
-        r = client.responses.create(
+        response = client.responses.create(
             model="gpt-5.6-luna",
             instructions=(
                 "تو سردبیر خبری فارسی‌زبان هستی. "
-                "خبر را در 2 تا 3 جمله کوتاه و دقیق خلاصه کن. "
-                "بی‌طرف باش و هیچ اطلاعاتی خارج از متن اضافه نکن. "
+                "خبر را در 2 تا 3 جمله کوتاه، دقیق و بی‌طرف خلاصه کن. "
+                "هیچ اطلاعاتی خارج از متن اضافه نکن. "
                 "فقط خلاصه را بنویس."
             ),
             input=source,
         )
 
-        result = r.output_text.strip()
+        result = response.output_text.strip()
 
         if result:
             return result
 
     except Exception as e:
-        print("OpenAI error:", e)
+        print("Summary error:", e)
 
     return clean(description)[:500] or title
 
 
-def find_image_url(item):
+def find_rss_image_url(item):
+    candidates = []
+
     for child in item:
         tag = child.tag.lower()
 
@@ -87,7 +169,7 @@ def find_image_url(item):
             url = child.attrib.get("url")
 
             if url:
-                return url
+                candidates.append(url)
 
     enclosure = item.find("enclosure")
 
@@ -95,7 +177,7 @@ def find_image_url(item):
         url = enclosure.attrib.get("url")
 
         if url:
-            return url
+            candidates.append(url)
 
     description = item.findtext("description") or ""
 
@@ -106,64 +188,169 @@ def find_image_url(item):
     )
 
     if match:
-        return html.unescape(match.group(1))
-
-    return None
-
-
-def find_article_image(link):
-    try:
-        r = requests.get(
-            link,
-            headers=HEADERS,
-            timeout=20,
+        candidates.append(
+            html.unescape(match.group(1))
         )
 
-        r.raise_for_status()
+    return candidates
 
-        patterns = [
-            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
-            r'<meta[^>]+content=["\']([^"\']+)[^>]+property=["\']og:image',
-            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)',
-        ]
 
-        for pattern in patterns:
-            match = re.search(
-                pattern,
-                r.text,
-                re.IGNORECASE,
-            )
+def extract_meta_images(page_text, final_url):
+    candidates = []
 
-            if match:
-                return urljoin(
-                    r.url,
+    patterns = [
+        r'<meta[^>]+property=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+content=["\']([^"\']+)[^>]+property=["\']og:image(?::secure_url)?["\']',
+        r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+content=["\']([^"\']+)[^>]+name=["\']twitter:image(?::src)?["\']',
+    ]
+
+    for pattern in patterns:
+        for match in re.finditer(
+            pattern,
+            page_text,
+            re.IGNORECASE,
+        ):
+            candidates.append(
+                urljoin(
+                    final_url,
                     html.unescape(match.group(1)),
                 )
+            )
 
-    except Exception as e:
-        print("Article image error:", e)
+    # JSON-LD
+    for block in re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        page_text,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        try:
+            data = json.loads(
+                html.unescape(block)
+            )
 
-    return None
+            def collect_images(obj):
+                found = []
+
+                if isinstance(obj, dict):
+                    value = obj.get("image")
+
+                    if isinstance(value, str):
+                        found.append(value)
+
+                    elif isinstance(value, dict):
+                        url = (
+                            value.get("url")
+                            or value.get("contentUrl")
+                        )
+
+                        if isinstance(url, str):
+                            found.append(url)
+
+                    elif isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, str):
+                                found.append(item)
+
+                            elif isinstance(item, dict):
+                                url = (
+                                    item.get("url")
+                                    or item.get("contentUrl")
+                                )
+
+                                if isinstance(url, str):
+                                    found.append(url)
+
+                    for value in obj.values():
+                        found.extend(
+                            collect_images(value)
+                        )
+
+                elif isinstance(obj, list):
+                    for item in obj:
+                        found.extend(
+                            collect_images(item)
+                        )
+
+                return found
+
+            for image_url in collect_images(data):
+                candidates.append(
+                    urljoin(
+                        final_url,
+                        image_url,
+                    )
+                )
+
+        except Exception:
+            pass
+
+    # تصاویر داخل صفحه
+    for match in re.finditer(
+        r'<img\b[^>]*(?:src|data-src|data-original)=["\']([^"\']+)',
+        page_text,
+        re.IGNORECASE,
+    ):
+        candidates.append(
+            urljoin(
+                final_url,
+                html.unescape(match.group(1)),
+            )
+        )
+
+    unique = []
+    seen = set()
+
+    for url in candidates:
+        if url and url not in seen:
+            seen.add(url)
+            unique.append(url)
+
+    return unique
 
 
-def download_image(url):
+def download_image(
+    url,
+    minimum_width=500,
+    minimum_height=300,
+):
     if not url:
         return None
 
     try:
-        r = requests.get(
+        response = requests.get(
             url,
             headers=HEADERS,
             timeout=20,
         )
 
-        r.raise_for_status()
+        response.raise_for_status()
+
+        content_type = (
+            response.headers
+            .get("content-type", "")
+            .lower()
+        )
+
+        if (
+            content_type
+            and not content_type.startswith("image/")
+        ):
+            return None
 
         image = Image.open(
-            BytesIO(r.content)
+            BytesIO(response.content)
         ).convert("RGBA")
 
-        if image.width < 250 or image.height < 150:
+        if (
+            image.width < minimum_width
+            or image.height < minimum_height
+        ):
+            return None
+
+        ratio = image.width / image.height
+
+        if ratio < 0.35 or ratio > 3.2:
             return None
 
         return image
@@ -174,14 +361,100 @@ def download_image(url):
     return None
 
 
+def find_best_article_image(link):
+    try:
+        response = requests.get(
+            link,
+            headers=HEADERS,
+            timeout=25,
+            allow_redirects=True,
+        )
+
+        response.raise_for_status()
+
+        candidates = extract_meta_images(
+            response.text,
+            response.url,
+        )
+
+        for image_url in candidates:
+            image = download_image(
+                image_url
+            )
+
+            if image is not None:
+                print(
+                    "Article image selected:",
+                    image_url,
+                )
+
+                return image
+
+    except Exception as e:
+        print(
+            "Article page error:",
+            e,
+        )
+
+    return None
+
+
+def prepare_image(item, link):
+    # اول عکس اصلی منبع خبر
+    image = find_best_article_image(link)
+
+    if image is not None:
+        return image
+
+    # بعد عکس RSS / Google News
+    for image_url in find_rss_image_url(item):
+        image = download_image(
+            image_url
+        )
+
+        if image is not None:
+            print(
+                "RSS image selected:",
+                image_url,
+            )
+
+            return image
+
+    # عکس پیش‌فرض اختصاصی
+    if os.path.exists(FALLBACK_FILE):
+        try:
+            image = Image.open(
+                FALLBACK_FILE
+            ).convert("RGBA")
+
+            print(
+                "Fallback image selected."
+            )
+
+            return image
+
+        except Exception as e:
+            print(
+                "Fallback image error:",
+                e,
+            )
+
+    return create_fallback()
+
+
 def load_logo():
     try:
         return Image.open(
             LOGO_FILE
         ).convert("RGBA")
+
     except Exception as e:
-        print("Logo error:", e)
-        return None
+        print(
+            "Logo error:",
+            e,
+        )
+
+    return None
 
 
 def get_font(size):
@@ -190,6 +463,7 @@ def get_font(size):
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             size,
         )
+
     except Exception:
         return ImageFont.load_default()
 
@@ -206,7 +480,6 @@ def add_branding(image):
         int(image.width * 0.025),
     )
 
-    # Bottom elegant dark gradient-like panel
     panel_height = max(
         105,
         int(image.height * 0.16),
@@ -214,16 +487,21 @@ def add_branding(image):
 
     panel = Image.new(
         "RGBA",
-        (image.width, panel_height),
+        (
+            image.width,
+            panel_height,
+        ),
         (0, 0, 0, 155),
     )
 
     image.alpha_composite(
         panel,
-        (0, image.height - panel_height),
+        (
+            0,
+            image.height - panel_height,
+        ),
     )
 
-    # Logo
     if logo:
         max_logo_width = int(
             image.width * 0.22
@@ -274,10 +552,12 @@ def add_branding(image):
 
         image.alpha_composite(
             logo,
-            (logo_x, logo_y),
+            (
+                logo_x,
+                logo_y,
+            ),
         )
 
-    # Channel address
     font = get_font(
         max(
             24,
@@ -293,10 +573,16 @@ def add_branding(image):
         font=font,
     )
 
-    text_width = bbox[2] - bbox[0]
-    text_height = bbox[3] - bbox[1]
+    text_width = (
+        bbox[2] - bbox[0]
+    )
+
+    text_height = (
+        bbox[3] - bbox[1]
+    )
 
     text_x = margin
+
     text_y = (
         image.height
         - panel_height
@@ -306,7 +592,6 @@ def add_branding(image):
         ) // 2
     )
 
-    # Small rounded background behind address
     padding_x = 14
     padding_y = 9
 
@@ -322,7 +607,10 @@ def add_branding(image):
     )
 
     draw.text(
-        (text_x, text_y),
+        (
+            text_x,
+            text_y,
+        ),
         text,
         font=font,
         fill="white",
@@ -331,52 +619,29 @@ def add_branding(image):
     return image
 
 
-def create_fallback(title):
+def create_fallback():
     width = 1280
     height = 720
 
     image = Image.new(
         "RGBA",
-        (width, height),
+        (
+            width,
+            height,
+        ),
         (25, 31, 42, 255),
     )
 
     draw = ImageDraw.Draw(image)
 
-    logo = load_logo()
-
-    if logo:
-        ratio = 350 / logo.width
-
-        logo = logo.resize(
-            (
-                int(logo.width * ratio),
-                int(logo.height * ratio),
-            ),
-            Image.LANCZOS,
-        )
-
-        image.alpha_composite(
-            logo,
-            (
-                (width - logo.width) // 2,
-                70,
-            ),
-        )
-
     font = get_font(42)
 
     draw.text(
-        (width // 2, 360),
-        title[:100],
-        font=font,
-        fill="white",
-        anchor="mm",
-    )
-
-    draw.text(
-        (width // 2, 640),
-        CHANNEL_TEXT,
+        (
+            width // 2,
+            height // 2,
+        ),
+        "جهان‌تاب",
         font=font,
         fill="white",
         anchor="mm",
@@ -385,23 +650,12 @@ def create_fallback(title):
     return image
 
 
-def prepare_image(item, link, title):
-    image = download_image(
-        find_image_url(item)
-    )
-
-    if image is None:
-        image = download_image(
-            find_article_image(link)
-        )
-
-    if image is None:
-        image = create_fallback(title)
-
-    return add_branding(image)
-
-
-def make_caption(title, summary, link):
+def make_caption(
+    title,
+    summary,
+    link,
+    status,
+):
     title = html.escape(title)
     summary = html.escape(summary)
     link = html.escape(
@@ -409,37 +663,59 @@ def make_caption(title, summary, link):
         quote=True,
     )
 
+    prefix = (
+        "🚨 <b>فوری</b>\n"
+        if status == "URGENT"
+        else ""
+    )
+
     caption = (
-        f"🚨 <b>{title}</b>\n\n"
+        f"{prefix}"
+        f"📰 <b>{title}</b>\n\n"
         f"📝 <b>خلاصه خبر</b>\n"
         f"{summary}\n\n"
-        f'🔗 <a href="{link}">مشاهده خبر اصلی</a>'
+        f'🔗 <a href="{link}">'
+        f"مشاهده خبر اصلی"
+        f"</a>"
     )
 
     if len(caption) <= 1024:
         return caption
 
-    # Keep the caption inside Telegram's limit
+    fixed = (
+        f"{prefix}"
+        f"📰 <b>{title}</b>\n\n"
+        f"📝 <b>خلاصه خبر</b>\n\n"
+        f'🔗 <a href="{link}">'
+        f"مشاهده خبر اصلی"
+        f"</a>"
+    )
+
     available = max(
         100,
-        1024 - len(
-            f"🚨 <b>{title}</b>\n\n"
-            f"📝 <b>خلاصه خبر</b>\n\n"
-            f'🔗 <a href="{link}">مشاهده خبر اصلی</a>'
-        ) - 10,
+        1024 - len(fixed) - 10,
     )
 
     summary = summary[:available].rstrip()
 
     return (
-        f"🚨 <b>{title}</b>\n\n"
+        f"{prefix}"
+        f"📰 <b>{title}</b>\n\n"
         f"📝 <b>خلاصه خبر</b>\n"
         f"{summary}\n\n"
-        f'🔗 <a href="{link}">مشاهده خبر اصلی</a>'
+        f'🔗 <a href="{link}">'
+        f"مشاهده خبر اصلی"
+        f"</a>"
     )
 
 
-def send_photo(image, title, summary, link):
+def send_photo(
+    image,
+    title,
+    summary,
+    link,
+    status,
+):
     buffer = BytesIO()
 
     image.convert("RGB").save(
@@ -459,6 +735,7 @@ def send_photo(image, title, summary, link):
                 title,
                 summary,
                 link,
+                status,
             ),
             "parse_mode": "HTML",
         },
@@ -482,7 +759,9 @@ def send_photo(image, title, summary, link):
 
 
 def main():
-    print("Starting Telegram News Bot...")
+    print(
+        "Starting Telegram News Bot..."
+    )
 
     response = requests.get(
         RSS_URL,
@@ -508,7 +787,6 @@ def main():
     )
 
     for item in items:
-
         title = (
             item.findtext("title")
             or ""
@@ -531,11 +809,24 @@ def main():
             continue
 
         print(
-            "New article:",
+            "Checking:",
             title,
         )
 
-        news_summary = make_summary(
+        status = classify_news(
+            title,
+            description,
+        )
+
+        print(
+            "Classification:",
+            status,
+        )
+
+        if status == "SKIP":
+            continue
+
+        summary = make_summary(
             title,
             description,
         )
@@ -543,14 +834,18 @@ def main():
         image = prepare_image(
             item,
             link,
-            title,
+        )
+
+        image = add_branding(
+            image
         )
 
         send_photo(
             image,
             title,
-            news_summary,
+            summary,
             link,
+            status,
         )
 
         save_sent(link)
