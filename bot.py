@@ -9,6 +9,7 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 from openai import OpenAI
 
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL = os.environ["CHANNEL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
@@ -36,59 +37,88 @@ def clean(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
-def sent_links():
+def load_sent():
     if not os.path.exists(SENT_FILE):
         return set()
+
     with open(SENT_FILE, encoding="utf-8") as f:
         return {x.strip() for x in f if x.strip()}
 
 
-def save_link(link):
+def save_sent(link):
     with open(SENT_FILE, "a", encoding="utf-8") as f:
         f.write(link + "\n")
 
 
-def summary(title, description):
-    text = f"عنوان: {title}\nمتن: {clean(description)}"
+def make_summary(title, description):
+    source = (
+        f"عنوان خبر:\n{title}\n\n"
+        f"متن خبر:\n{clean(description)}"
+    )
 
     try:
         r = client.responses.create(
             model="gpt-5.6-luna",
             instructions=(
-                "خبر را به فارسی خلاصه کن. "
-                "فقط 2 تا 3 جمله کوتاه و دقیق بنویس. "
-                "بی‌طرف باش و اطلاعات جدید اضافه نکن."
+                "تو سردبیر خبری فارسی‌زبان هستی. "
+                "خبر را در 2 تا 3 جمله کوتاه و دقیق خلاصه کن. "
+                "بی‌طرف باش و هیچ اطلاعاتی خارج از متن اضافه نکن. "
+                "فقط خلاصه را بنویس."
             ),
-            input=text,
+            input=source,
         )
-        if r.output_text.strip():
-            return r.output_text.strip()
+
+        result = r.output_text.strip()
+
+        if result:
+            return result
+
     except Exception as e:
         print("OpenAI error:", e)
 
     return clean(description)[:500] or title
 
 
-def image_url(item):
-    for x in item:
-        tag = x.tag.lower()
+def find_image_url(item):
+    for child in item:
+        tag = child.tag.lower()
+
         if tag.endswith("content") or tag.endswith("thumbnail"):
-            u = x.attrib.get("url")
-            if u:
-                return u
+            url = child.attrib.get("url")
 
-    enc = item.find("enclosure")
-    if enc is not None and enc.attrib.get("url"):
-        return enc.attrib["url"]
+            if url:
+                return url
 
-    d = item.findtext("description") or ""
-    m = re.search(r'<img[^>]+src=["\']([^"\']+)', d, re.I)
-    return html.unescape(m.group(1)) if m else None
+    enclosure = item.find("enclosure")
+
+    if enclosure is not None:
+        url = enclosure.attrib.get("url")
+
+        if url:
+            return url
+
+    description = item.findtext("description") or ""
+
+    match = re.search(
+        r'<img[^>]+src=["\']([^"\']+)',
+        description,
+        re.IGNORECASE,
+    )
+
+    if match:
+        return html.unescape(match.group(1))
+
+    return None
 
 
-def article_image(link):
+def find_article_image(link):
     try:
-        r = requests.get(link, headers=HEADERS, timeout=20)
+        r = requests.get(
+            link,
+            headers=HEADERS,
+            timeout=20,
+        )
+
         r.raise_for_status()
 
         patterns = [
@@ -97,17 +127,26 @@ def article_image(link):
             r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)',
         ]
 
-        for p in patterns:
-            m = re.search(p, r.text, re.I)
-            if m:
-                return urljoin(r.url, html.unescape(m.group(1)))
+        for pattern in patterns:
+            match = re.search(
+                pattern,
+                r.text,
+                re.IGNORECASE,
+            )
+
+            if match:
+                return urljoin(
+                    r.url,
+                    html.unescape(match.group(1)),
+                )
+
     except Exception as e:
         print("Article image error:", e)
 
     return None
 
 
-def download(url):
+def download_image(url):
     if not url:
         return None
 
@@ -115,253 +154,411 @@ def download(url):
         r = requests.get(
             url,
             headers=HEADERS,
-            timeout=20
+            timeout=20,
         )
+
         r.raise_for_status()
 
-        im = Image.open(
+        image = Image.open(
             BytesIO(r.content)
         ).convert("RGBA")
 
-        if im.width < 250 or im.height < 150:
+        if image.width < 250 or image.height < 150:
             return None
 
-        return im
+        return image
+
     except Exception as e:
-        print("Download image error:", e)
-        return None
+        print("Image error:", e)
+
+    return None
 
 
-def logo():
+def load_logo():
     try:
-        return Image.open(LOGO_FILE).convert("RGBA")
-    except Exception:
+        return Image.open(
+            LOGO_FILE
+        ).convert("RGBA")
+    except Exception as e:
+        print("Logo error:", e)
         return None
 
 
-def branding(im):
-    im = im.convert("RGBA")
-    draw = ImageDraw.Draw(im)
-    L = logo()
+def get_font(size):
+    try:
+        return ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            size,
+        )
+    except Exception:
+        return ImageFont.load_default()
 
-    strip = max(90, int(im.height * 0.15))
 
-    dark = Image.new(
+def add_branding(image):
+    image = image.convert("RGBA")
+
+    draw = ImageDraw.Draw(image)
+
+    logo = load_logo()
+
+    margin = max(
+        18,
+        int(image.width * 0.025),
+    )
+
+    # Bottom elegant dark gradient-like panel
+    panel_height = max(
+        105,
+        int(image.height * 0.16),
+    )
+
+    panel = Image.new(
         "RGBA",
-        (im.width, strip),
-        (0, 0, 0, 140)
+        (image.width, panel_height),
+        (0, 0, 0, 155),
     )
 
-    im.alpha_composite(
-        dark,
-        (0, im.height - strip)
+    image.alpha_composite(
+        panel,
+        (0, image.height - panel_height),
     )
 
-    margin = max(18, int(im.width * 0.025))
-
-    if L:
-        max_w = int(im.width * 0.20)
-        ratio = max_w / L.width
-        L = L.resize(
-            (int(L.width * ratio),
-             int(L.height * ratio)),
-            Image.LANCZOS
+    # Logo
+    if logo:
+        max_logo_width = int(
+            image.width * 0.22
         )
 
-        max_h = strip - margin * 2
+        ratio = (
+            max_logo_width /
+            logo.width
+        )
 
-        if L.height > max_h:
-            ratio = max_h / L.height
-            L = L.resize(
-                (int(L.width * ratio),
-                 int(L.height * ratio)),
-                Image.LANCZOS
-            )
-
-        im.alpha_composite(
-            L,
+        logo = logo.resize(
             (
-                im.width - L.width - margin,
-                im.height - L.height - margin
+                int(logo.width * ratio),
+                int(logo.height * ratio),
+            ),
+            Image.LANCZOS,
+        )
+
+        max_logo_height = (
+            panel_height - margin * 2
+        )
+
+        if logo.height > max_logo_height:
+            ratio = (
+                max_logo_height /
+                logo.height
             )
+
+            logo = logo.resize(
+                (
+                    int(logo.width * ratio),
+                    int(logo.height * ratio),
+                ),
+                Image.LANCZOS,
+            )
+
+        logo_x = (
+            image.width
+            - logo.width
+            - margin
         )
 
-    try:
-        font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            max(24, int(im.width * 0.025))
+        logo_y = (
+            image.height
+            - logo.height
+            - margin
         )
-    except Exception:
-        font = ImageFont.load_default()
 
-    draw.text(
-        (margin, im.height - strip + margin),
-        CHANNEL_TEXT,
+        image.alpha_composite(
+            logo,
+            (logo_x, logo_y),
+        )
+
+    # Channel address
+    font = get_font(
+        max(
+            24,
+            int(image.width * 0.026),
+        )
+    )
+
+    text = CHANNEL_TEXT
+
+    bbox = draw.textbbox(
+        (0, 0),
+        text,
         font=font,
-        fill="white"
     )
 
-    return im
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
 
-
-def fallback(title):
-    im = Image.new(
-        "RGBA",
-        (1280, 720),
-        (25, 30, 40, 255)
+    text_x = margin
+    text_y = (
+        image.height
+        - panel_height
+        + (
+            panel_height
+            - text_height
+        ) // 2
     )
 
-    draw = ImageDraw.Draw(im)
-    L = logo()
+    # Small rounded background behind address
+    padding_x = 14
+    padding_y = 9
 
-    if L:
-        ratio = 350 / L.width
-        L = L.resize(
-            (int(L.width * ratio),
-             int(L.height * ratio)),
-            Image.LANCZOS
-        )
-
-        im.alpha_composite(
-            L,
-            ((1280 - L.width) // 2, 70)
-        )
-
-    try:
-        font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            42
-        )
-    except Exception:
-        font = ImageFont.load_default()
+    draw.rounded_rectangle(
+        (
+            text_x - padding_x,
+            text_y - padding_y,
+            text_x + text_width + padding_x,
+            text_y + text_height + padding_y,
+        ),
+        radius=14,
+        fill=(0, 0, 0, 175),
+    )
 
     draw.text(
-        (640, 360),
+        (text_x, text_y),
+        text,
+        font=font,
+        fill="white",
+    )
+
+    return image
+
+
+def create_fallback(title):
+    width = 1280
+    height = 720
+
+    image = Image.new(
+        "RGBA",
+        (width, height),
+        (25, 31, 42, 255),
+    )
+
+    draw = ImageDraw.Draw(image)
+
+    logo = load_logo()
+
+    if logo:
+        ratio = 350 / logo.width
+
+        logo = logo.resize(
+            (
+                int(logo.width * ratio),
+                int(logo.height * ratio),
+            ),
+            Image.LANCZOS,
+        )
+
+        image.alpha_composite(
+            logo,
+            (
+                (width - logo.width) // 2,
+                70,
+            ),
+        )
+
+    font = get_font(42)
+
+    draw.text(
+        (width // 2, 360),
         title[:100],
         font=font,
         fill="white",
-        anchor="mm"
+        anchor="mm",
     )
 
     draw.text(
-        (640, 650),
+        (width // 2, 640),
         CHANNEL_TEXT,
         font=font,
         fill="white",
-        anchor="mm"
+        anchor="mm",
     )
 
-    return im
+    return image
 
 
-def make_image(item, link, title):
-    im = download(image_url(item))
+def prepare_image(item, link, title):
+    image = download_image(
+        find_image_url(item)
+    )
 
-    if im is None:
-        im = download(article_image(link))
+    if image is None:
+        image = download_image(
+            find_article_image(link)
+        )
 
-    if im is None:
-        im = fallback(title)
+    if image is None:
+        image = create_fallback(title)
 
-    return branding(im)
+    return add_branding(image)
 
 
-def caption(title, text, link):
+def make_caption(title, summary, link):
     title = html.escape(title)
-    text = html.escape(text)
-    link = html.escape(link, quote=True)
+    summary = html.escape(summary)
+    link = html.escape(
+        link,
+        quote=True,
+    )
 
-    result = (
+    caption = (
         f"🚨 <b>{title}</b>\n\n"
-        f"📝 <b>خلاصه خبر:</b>\n"
-        f"{text}\n\n"
-        f'🔗 <a href="{link}">مشاهده خبر</a>'
+        f"📝 <b>خلاصه خبر</b>\n"
+        f"{summary}\n\n"
+        f'🔗 <a href="{link}">مشاهده خبر اصلی</a>'
     )
 
-    return result[:1024]
+    if len(caption) <= 1024:
+        return caption
+
+    # Keep the caption inside Telegram's limit
+    available = max(
+        100,
+        1024 - len(
+            f"🚨 <b>{title}</b>\n\n"
+            f"📝 <b>خلاصه خبر</b>\n\n"
+            f'🔗 <a href="{link}">مشاهده خبر اصلی</a>'
+        ) - 10,
+    )
+
+    summary = summary[:available].rstrip()
+
+    return (
+        f"🚨 <b>{title}</b>\n\n"
+        f"📝 <b>خلاصه خبر</b>\n"
+        f"{summary}\n\n"
+        f'🔗 <a href="{link}">مشاهده خبر اصلی</a>'
+    )
 
 
-def send(im, title, text, link):
-    buf = BytesIO()
-    im.convert("RGB").save(
-        buf,
+def send_photo(image, title, summary, link):
+    buffer = BytesIO()
+
+    image.convert("RGB").save(
+        buffer,
         "JPEG",
-        quality=92
+        quality=92,
+        optimize=True,
     )
-    buf.seek(0)
 
-    r = requests.post(
+    buffer.seek(0)
+
+    response = requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
         data={
             "chat_id": CHANNEL,
-            "caption": caption(title, text, link),
-            "parse_mode": "HTML"
+            "caption": make_caption(
+                title,
+                summary,
+                link,
+            ),
+            "parse_mode": "HTML",
         },
         files={
             "photo": (
-                "news.jpg",
-                buf,
-                "image/jpeg"
-            )
+                "jahantab_news.jpg",
+                buffer,
+                "image/jpeg",
+            ),
         },
-        timeout=40
+        timeout=40,
     )
 
-    print("Telegram:", r.status_code, r.text[:300])
-    r.raise_for_status()
+    print(
+        "Telegram:",
+        response.status_code,
+        response.text[:300],
+    )
+
+    response.raise_for_status()
 
 
 def main():
     print("Starting Telegram News Bot...")
 
-    r = requests.get(
+    response = requests.get(
         RSS_URL,
         headers=HEADERS,
-        timeout=30
+        timeout=30,
     )
-    r.raise_for_status()
 
-    root = ET.fromstring(r.text)
-    items = root.findall("./channel/item")
+    response.raise_for_status()
 
-    old = sent_links()
+    root = ET.fromstring(
+        response.text
+    )
 
-    print("RSS items:", len(items))
+    items = root.findall(
+        "./channel/item"
+    )
+
+    sent = load_sent()
+
+    print(
+        "RSS items:",
+        len(items),
+    )
 
     for item in items:
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        description = item.findtext("description") or ""
+
+        title = (
+            item.findtext("title")
+            or ""
+        ).strip()
+
+        link = (
+            item.findtext("link")
+            or ""
+        ).strip()
+
+        description = (
+            item.findtext("description")
+            or ""
+        )
 
         if not title or not link:
             continue
 
-        if link in old:
+        if link in sent:
             continue
 
-        print("New article:", title)
-
-        text = summary(
+        print(
+            "New article:",
             title,
-            description
         )
 
-        im = make_image(
+        news_summary = make_summary(
+            title,
+            description,
+        )
+
+        image = prepare_image(
             item,
             link,
-            title
-        )
-
-        send(
-            im,
             title,
-            text,
-            link
         )
 
-        save_link(link)
+        send_photo(
+            image,
+            title,
+            news_summary,
+            link,
+        )
 
-        print("Published successfully.")
+        save_sent(link)
+
+        print(
+            "Published successfully."
+        )
+
         break
 
 
