@@ -8,7 +8,7 @@ on:
 
 
 # ============================================================
-# جلوگیری از اجرای هم‌زمان چند Run
+# جلوگیری از اجرای هم‌زمان
 # ============================================================
 
 concurrency:
@@ -17,7 +17,7 @@ concurrency:
 
 
 # ============================================================
-# دسترسی برای ذخیره sent_links.txt داخل Repository
+# اجازه ذخیره فایل‌های ضدتکرار در Repository
 # ============================================================
 
 permissions:
@@ -51,7 +51,7 @@ jobs:
 
 
       # --------------------------------------------------------
-      # Dependencies
+      # نصب کتابخانه‌ها
       # --------------------------------------------------------
 
       - name: Install dependencies
@@ -61,28 +61,41 @@ jobs:
 
 
       # --------------------------------------------------------
-      # نمایش وضعیت sent_links.txt قبل از اجرا
+      # بررسی فایل‌های ضدتکرار
       # --------------------------------------------------------
 
-      - name: Check sent links
+      - name: Prepare deduplication files
         run: |
+
           echo "=========================================="
-          echo "JAHANTAB SENT LINKS STATUS"
+          echo "JAHANTAB DEDUPLICATION STATUS"
           echo "=========================================="
 
-          if [ -f sent_links.txt ]; then
-            echo "sent_links.txt exists."
+          if [ ! -f sent_links.txt ]; then
+            echo "sent_links.txt not found."
+            echo "Creating it..."
+            touch sent_links.txt
+          else
+            echo "sent_links.txt found."
 
             COUNT=$(grep -cve '^[[:space:]]*$' sent_links.txt || true)
 
-            echo "Saved sent links: $COUNT"
-            echo "File size:"
-            ls -lh sent_links.txt
-
-          else
-            echo "sent_links.txt does not exist yet."
-            touch sent_links.txt
+            echo "Saved links: $COUNT"
           fi
+
+
+          if [ ! -f sent_titles.txt ]; then
+            echo "sent_titles.txt not found."
+            echo "Creating it..."
+            touch sent_titles.txt
+          else
+            echo "sent_titles.txt found."
+
+            COUNT=$(grep -cve '^[[:space:]]*$' sent_titles.txt || true)
+
+            echo "Saved titles: $COUNT"
+          fi
+
 
           echo "=========================================="
 
@@ -101,35 +114,54 @@ jobs:
 
 
       # --------------------------------------------------------
-      # ذخیره sent_links.txt داخل GitHub
+      # ذخیره فایل‌های ضدتکرار
       # --------------------------------------------------------
 
-      - name: Save sent links
+      - name: Save deduplication files
         if: always()
         run: |
 
           echo "=========================================="
-          echo "SAVING SENT LINKS"
+          echo "SAVING JAHANTAB DEDUPLICATION DATA"
           echo "=========================================="
+
 
           if [ ! -f sent_links.txt ]; then
             echo "sent_links.txt does not exist."
-            exit 0
+            touch sent_links.txt
           fi
+
+
+          if [ ! -f sent_titles.txt ]; then
+            echo "sent_titles.txt does not exist."
+            touch sent_titles.txt
+          fi
+
 
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
 
           git add sent_links.txt
+          git add sent_titles.txt
+
 
           if git diff --cached --quiet; then
-            echo "No changes to sent_links.txt"
-            exit 0
+
+            echo "No changes to deduplication files."
+
+          else
+
+            git commit \
+              -m "Update JAHANTAB deduplication data"
+
+            git push
+
+            echo "Deduplication files successfully saved."
+
           fi
 
-          git commit -m "Update JAHANTAB sent links"
 
-          git push
-
-          echo "sent_links.txt successfully saved."
           echo "=========================================="
