@@ -3,22 +3,18 @@
 """
 JAHANTAB Telegram News Bot
 
-هدف:
-فقط خبرهای فوری و مهم درباره جنگ ایران
-و درگیری‌های مرتبط با منطقه
-
 ویژگی‌ها:
 - منابع فارسی
-- RSS
-- HTML fallback
-- استخراج عنوان، خلاصه و عکس
-- فیلتر موضوعی جنگ
-- امتیاز اهمیت و فوریت
-- حذف خبرهای تکراری
-- حذف مطالب تحلیلی و غیرمرتبط
-- افزودن لوگوی JAHANTAB روی عکس
+- RSS + HTML fallback
+- فیلتر سخت‌گیرانه اخبار جنگ ایران و منطقه
+- حذف اخبار قدیمی
+- حذف اخبار تحلیلی
+- حذف خبرهای تکراری با لینک
+- حذف خبرهای تکراری با عنوان
+- حذف خبرهای مشابه بین منابع مختلف
+- ذخیره دائمی خبرهای ارسال‌شده
+- افزودن لوگو روی عکس
 - ارسال عکس + کپشن به Telegram
-- امکان کپی متن کپشن و لینک خبر
 """
 
 import os
@@ -48,14 +44,36 @@ except ImportError:
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "24"))
-URGENT_HOURS = int(os.getenv("URGENT_HOURS", "6"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "16"))
-MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "3"))
-MAX_ITEMS_PER_SOURCE = int(os.getenv("MAX_ITEMS_PER_SOURCE", "12"))
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
+CHAT_ID = (
+    os.getenv("CHAT_ID", "").strip()
+    or os.getenv("CHANNEL", "").strip()
+    or "@jahantab_news"
+)
+
+MAX_AGE_HOURS = int(
+    os.getenv("MAX_AGE_HOURS", "24")
+)
+
+URGENT_HOURS = int(
+    os.getenv("URGENT_HOURS", "6")
+)
+
+MIN_SCORE = int(
+    os.getenv("MIN_SCORE", "16")
+)
+
+MAX_POSTS_PER_RUN = int(
+    os.getenv("MAX_POSTS_PER_RUN", "3")
+)
+
+MAX_ITEMS_PER_SOURCE = int(
+    os.getenv("MAX_ITEMS_PER_SOURCE", "12")
+)
+
+HTTP_TIMEOUT = int(
+    os.getenv("HTTP_TIMEOUT", "20")
+)
 
 BASE_DIR = os.path.dirname(
     os.path.abspath(__file__)
@@ -66,6 +84,15 @@ SENT_FILE = os.path.join(
     os.getenv(
         "SENT_FILE",
         "sent_links.txt"
+    )
+)
+
+# فایل دوم برای جلوگیری از تکرار عنوان
+SENT_TITLES_FILE = os.path.join(
+    BASE_DIR,
+    os.getenv(
+        "SENT_TITLES_FILE",
+        "sent_titles.txt"
     )
 )
 
@@ -86,14 +113,15 @@ USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/128.0 Safari/537.36 "
-    "JAHANTAB-NewsBot/2.0"
+    "JAHANTAB-NewsBot/3.0"
 )
 
 HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
     ),
     "Accept-Language": "fa-IR,fa;q=0.9,en;q=0.5",
 }
@@ -337,8 +365,6 @@ MILITARY_ACTIONS = {
     "تأسیسات نظامی": 7,
     "تاسیسات هسته‌ای": 8,
     "تأسیسات هسته‌ای": 8,
-    "تاسیسات هسته ای": 8,
-    "تأسیسات هسته ای": 8,
     "نیروهای آمریکایی": 6,
     "نیروهای اسرائیلی": 6,
     "ارتش اسرائیل": 6,
@@ -459,7 +485,7 @@ SESSION.headers.update(HEADERS)
 
 
 # ============================================================
-# TEXT HELPERS
+# TEXT
 # ============================================================
 
 def normalize_text(text):
@@ -488,7 +514,11 @@ def normalize_text(text):
     for old, new in replacements.items():
         text = text.replace(old, new)
 
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
 
     return text.strip().lower()
 
@@ -513,6 +543,7 @@ def clean_html(text):
     )
 
     result = html.unescape(result)
+
     result = re.sub(
         r"\s+",
         " ",
@@ -531,7 +562,10 @@ def shorten(text, max_len):
     cut = text[:max_len]
 
     if " " in cut:
-        cut = cut.rsplit(" ", 1)[0]
+        cut = cut.rsplit(
+            " ",
+            1
+        )[0]
 
     return cut.rstrip(
         " .،؛:"
@@ -539,7 +573,7 @@ def shorten(text, max_len):
 
 
 # ============================================================
-# URL HELPERS
+# URL
 # ============================================================
 
 def canonical_url(url):
@@ -549,7 +583,11 @@ def canonical_url(url):
     try:
         parsed = urlparse(url)
 
-        scheme = parsed.scheme.lower() or "https"
+        scheme = (
+            parsed.scheme.lower()
+            or "https"
+        )
+
         netloc = parsed.netloc.lower()
 
         if netloc.startswith("www."):
@@ -557,7 +595,10 @@ def canonical_url(url):
 
         path = parsed.path or "/"
 
-        if path != "/" and path.endswith("/"):
+        if (
+            path != "/"
+            and path.endswith("/")
+        ):
             path = path[:-1]
 
         return urlunparse(
@@ -577,7 +618,9 @@ def canonical_url(url):
 
 def same_domain(url, domain):
     try:
-        host = urlparse(url).netloc.lower()
+        host = urlparse(
+            url
+        ).netloc.lower()
 
         if host.startswith("www."):
             host = host[4:]
@@ -589,7 +632,9 @@ def same_domain(url, domain):
 
         return (
             host == domain
-            or host.endswith("." + domain)
+            or host.endswith(
+                "." + domain
+            )
         )
 
     except Exception:
@@ -607,55 +652,70 @@ def safe_get(url, **kwargs):
             HTTP_TIMEOUT
         )
 
-        response = SESSION.get(
+        return SESSION.get(
             url,
             timeout=timeout,
             allow_redirects=True,
             **kwargs,
         )
 
-        return response
-
     except requests.RequestException as e:
         log.warning(
             "GET failed | %s | %s",
             url,
-            e,
+            e
         )
         return None
 
 
 # ============================================================
-# SENT LINKS
+# SENT DATA
 # ============================================================
 
-def load_sent_links():
-    if not os.path.exists(SENT_FILE):
+def load_lines(filename):
+    if not os.path.exists(filename):
         return set()
 
     try:
         with open(
-            SENT_FILE,
+            filename,
             "r",
             encoding="utf-8"
         ) as f:
             return {
-                canonical_url(
-                    line.strip()
-                )
+                line.strip()
                 for line in f
                 if line.strip()
             }
 
     except Exception as e:
         log.warning(
-            "Could not read sent file: %s",
+            "Could not read %s | %s",
+            filename,
             e
         )
         return set()
 
 
-def save_sent_link(url):
+def load_sent_links():
+    return {
+        canonical_url(x)
+        for x in load_lines(
+            SENT_FILE
+        )
+    }
+
+
+def load_sent_titles():
+    return load_lines(
+        SENT_TITLES_FILE
+    )
+
+
+def save_sent_item(
+    url,
+    title
+):
     try:
         with open(
             SENT_FILE,
@@ -667,11 +727,34 @@ def save_sent_link(url):
                 + "\n"
             )
 
+        fingerprint = title_fingerprint(
+            title
+        )
+
+        if fingerprint:
+            with open(
+                SENT_TITLES_FILE,
+                "a",
+                encoding="utf-8"
+            ) as f:
+                f.write(
+                    fingerprint
+                    + "\n"
+                )
+
+        log.info(
+            "SAVED SENT ITEM | %s",
+            url
+        )
+
+        return True
+
     except Exception as e:
         log.error(
-            "Could not save sent link: %s",
+            "Could not save sent item | %s",
             e
         )
+        return False
 
 
 # ============================================================
@@ -683,7 +766,10 @@ def parse_datetime(value):
         return None
 
     try:
-        if hasattr(value, "tm_year"):
+        if hasattr(
+            value,
+            "tm_year"
+        ):
             return datetime(
                 value.tm_year,
                 value.tm_mon,
@@ -696,7 +782,10 @@ def parse_datetime(value):
     except Exception:
         pass
 
-    if isinstance(value, datetime):
+    if isinstance(
+        value,
+        datetime
+    ):
         if value.tzinfo is None:
             return value.replace(
                 tzinfo=timezone.utc
@@ -713,7 +802,9 @@ def age_hours(dt):
     if not dt:
         return 999999
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(
+        timezone.utc
+    )
 
     if dt.tzinfo is None:
         dt = dt.replace(
@@ -722,7 +813,9 @@ def age_hours(dt):
 
     delta = (
         now
-        - dt.astimezone(timezone.utc)
+        - dt.astimezone(
+            timezone.utc
+        )
     )
 
     return max(
@@ -732,13 +825,13 @@ def age_hours(dt):
 
 
 # ============================================================
-# RSS DISCOVERY
+# RSS
 # ============================================================
 
 def discover_feeds(source):
     feeds = []
 
-    common_paths = [
+    paths = [
         "/rss",
         "/rss/",
         "/feed",
@@ -752,7 +845,7 @@ def discover_feeds(source):
         "/fa/feed/",
     ]
 
-    for path in common_paths:
+    for path in paths:
         feeds.append(
             urljoin(
                 source["url"],
@@ -780,7 +873,9 @@ def discover_feeds(source):
                 )
 
                 typ = (
-                    link.get("type")
+                    link.get(
+                        "type"
+                    )
                     or ""
                 ).lower()
 
@@ -788,10 +883,9 @@ def discover_feeds(source):
                     rel,
                     list
                 ):
-                    rel_text = (
-                        " ".join(rel)
-                        .lower()
-                    )
+                    rel_text = " ".join(
+                        rel
+                    ).lower()
                 else:
                     rel_text = str(
                         rel
@@ -819,63 +913,60 @@ def discover_feeds(source):
                             )
                         )
 
-        except Exception as e:
-            log.debug(
-                "RSS discovery failed | %s | %s",
-                source["name"],
-                e,
-            )
+        except Exception:
+            pass
 
     result = []
 
     for url in feeds:
-        url = canonical_url(url)
+        url = canonical_url(
+            url
+        )
 
-        if not url:
-            continue
-
-        if url not in result:
+        if (
+            url
+            and url not in result
+        ):
             result.append(url)
 
     return result[:20]
 
 
-# ============================================================
-# RSS IMAGE
-# ============================================================
-
 def extract_entry_image(entry):
     candidates = []
 
-    media_content = entry.get(
+    for media in entry.get(
         "media_content",
         []
-    )
-
-    for media in media_content:
-        if isinstance(media, dict):
+    ):
+        if isinstance(
+            media,
+            dict
+        ):
             candidates.append(
                 media.get("url")
             )
 
-    media_thumbnail = entry.get(
+    for media in entry.get(
         "media_thumbnail",
         []
-    )
-
-    for media in media_thumbnail:
-        if isinstance(media, dict):
+    ):
+        if isinstance(
+            media,
+            dict
+        ):
             candidates.append(
                 media.get("url")
             )
 
-    enclosures = entry.get(
+    for enc in entry.get(
         "enclosures",
         []
-    )
-
-    for enc in enclosures:
-        if isinstance(enc, dict):
+    ):
+        if isinstance(
+            enc,
+            dict
+        ):
             candidates.append(
                 enc.get("href")
             )
@@ -885,29 +976,22 @@ def extract_entry_image(entry):
 
     for item in candidates:
         if item and item.startswith(
-            ("http://", "https://")
+            (
+                "http://",
+                "https://"
+            )
         ):
             return item
 
     return ""
 
 
-# ============================================================
-# RSS PARSER
-# ============================================================
-
-def parse_feed(source, feed_url):
+def parse_feed(
+    source,
+    feed_url
+):
     if feedparser is None:
-        log.error(
-            "feedparser is not installed."
-        )
         return []
-
-    log.info(
-        "RSS TRY | %s | %s",
-        source["name"],
-        feed_url
-    )
 
     response = safe_get(
         feed_url,
@@ -930,11 +1014,7 @@ def parse_feed(source, feed_url):
         parsed = feedparser.parse(
             response.content
         )
-    except Exception as e:
-        log.debug(
-            "Feed parse failed | %s",
-            e
-        )
+    except Exception:
         return []
 
     if not parsed.entries:
@@ -983,10 +1063,6 @@ def parse_feed(source, feed_url):
             or ""
         )
 
-        image = extract_entry_image(
-            entry
-        )
-
         published = None
 
         for key in [
@@ -1008,7 +1084,9 @@ def parse_feed(source, feed_url):
                 "title": title,
                 "summary": summary,
                 "url": url,
-                "image": image,
+                "image": extract_entry_image(
+                    entry
+                ),
                 "published": published,
                 "method": "rss",
             }
@@ -1018,7 +1096,7 @@ def parse_feed(source, feed_url):
 
 
 # ============================================================
-# HTML SCRAPER
+# HTML
 # ============================================================
 
 def is_probable_article_url(url):
@@ -1057,11 +1135,6 @@ def is_probable_article_url(url):
 
 
 def scrape_homepage(source):
-    log.info(
-        "HTML SCRAPE | %s",
-        source["name"]
-    )
-
     response = safe_get(
         source["url"]
     )
@@ -1079,6 +1152,7 @@ def scrape_homepage(source):
 
     items = []
     seen = set()
+
     anchors = []
 
     for article in soup.find_all(
@@ -1129,7 +1203,9 @@ def scrape_homepage(source):
         ):
             continue
 
-        url = canonical_url(url)
+        url = canonical_url(
+            url
+        )
 
         if url in seen:
             continue
@@ -1162,10 +1238,13 @@ def scrape_homepage(source):
 
 
 # ============================================================
-# ARTICLE PAGE
+# ARTICLE
 # ============================================================
 
-def extract_meta(soup, *names):
+def extract_meta(
+    soup,
+    *names
+):
     for name in names:
         tag = soup.find(
             "meta",
@@ -1216,10 +1295,6 @@ def extract_article_page(item):
     except Exception:
         return item
 
-    # ----------------------------
-    # TITLE
-    # ----------------------------
-
     title = extract_meta(
         soup,
         "og:title",
@@ -1234,10 +1309,6 @@ def extract_article_page(item):
     if title:
         item["title"] = title
 
-    # ----------------------------
-    # DESCRIPTION
-    # ----------------------------
-
     description = extract_meta(
         soup,
         "description",
@@ -1247,10 +1318,6 @@ def extract_article_page(item):
 
     if description:
         item["summary"] = description
-
-    # ----------------------------
-    # IMAGE
-    # ----------------------------
 
     image = extract_meta(
         soup,
@@ -1263,10 +1330,6 @@ def extract_article_page(item):
             response.url,
             image
         )
-
-    # ----------------------------
-    # ARTICLE BODY
-    # ----------------------------
 
     if len(
         item.get(
@@ -1311,17 +1374,13 @@ def extract_article_page(item):
                     break
 
         if paragraphs:
-            item["summary"] = (
-                " ".join(
-                    paragraphs[:4]
-                )
+            item["summary"] = " ".join(
+                paragraphs[:4]
             )
 
-    # ----------------------------
-    # IMAGE FALLBACK
-    # ----------------------------
-
-    if not item.get("image"):
+    if not item.get(
+        "image"
+    ):
         for img in soup.find_all(
             "img"
         ):
@@ -1390,7 +1449,9 @@ def calculate_score(item):
     matched_urgent = []
 
     for phrase, value in CORE_ENTITIES.items():
-        if normalize_text(phrase) in text:
+        if normalize_text(
+            phrase
+        ) in text:
             score += value
             matched_entities.append(
                 phrase
@@ -1406,36 +1467,48 @@ def calculate_score(item):
         }
 
     for phrase, value in MILITARY_ACTIONS.items():
-        if normalize_text(phrase) in text:
+        if normalize_text(
+            phrase
+        ) in text:
             score += value
             matched_actions.append(
                 phrase
             )
 
     for phrase, value in MAJOR_EVENTS.items():
-        if normalize_text(phrase) in text:
+        if normalize_text(
+            phrase
+        ) in text:
             score += value
             matched_major.append(
                 phrase
             )
 
     for phrase, value in URGENT_TERMS.items():
-        if normalize_text(phrase) in text:
+        if normalize_text(
+            phrase
+        ) in text:
             score += value
             matched_urgent.append(
                 phrase
             )
 
     for phrase, value in CASUALTY_TERMS.items():
-        if normalize_text(phrase) in text:
+        if normalize_text(
+            phrase
+        ) in text:
             score += value
 
     for phrase, value in ANALYSIS_TERMS.items():
-        if normalize_text(phrase) in text:
+        if normalize_text(
+            phrase
+        ) in text:
             score += value
 
     for phrase, value in EXCLUDE_TERMS.items():
-        if normalize_text(phrase) in text:
+        if normalize_text(
+            phrase
+        ) in text:
             score += value
 
     if (
@@ -1445,7 +1518,9 @@ def calculate_score(item):
         score -= 25
 
     analysis_found = any(
-        normalize_text(phrase) in text
+        normalize_text(
+            phrase
+        ) in text
         for phrase in [
             "تحلیل",
             "یادداشت",
@@ -1460,7 +1535,9 @@ def calculate_score(item):
     if (
         analysis_found
         and not matched_major
-        and len(matched_actions) < 2
+        and len(
+            matched_actions
+        ) < 2
     ):
         score -= 15
 
@@ -1492,15 +1569,19 @@ def is_relevant(item):
     )
 
     item["score"] = info["score"]
+
     item["matched_entities"] = (
         info["entities"]
     )
+
     item["matched_actions"] = (
         info["actions"]
     )
+
     item["matched_major"] = (
         info["major"]
     )
+
     item["matched_urgent"] = (
         info["urgent"]
     )
@@ -1518,7 +1599,7 @@ def is_relevant(item):
 
 
 # ============================================================
-# DEDUPLICATION
+# TITLE FINGERPRINT
 # ============================================================
 
 def title_fingerprint(title):
@@ -1541,6 +1622,10 @@ def title_fingerprint(title):
         "شدند",
         "کرد",
         "کردند",
+        "کرده",
+        "می",
+        "شود",
+        "شده",
         "در",
         "به",
         "از",
@@ -1548,6 +1633,14 @@ def title_fingerprint(title):
         "برای",
         "و",
         "یک",
+        "این",
+        "آن",
+        "را",
+        "که",
+        "بر",
+        "تا",
+        "اما",
+        "نیز",
     }
 
     words = [
@@ -1556,16 +1649,79 @@ def title_fingerprint(title):
         if word not in stopwords
     ]
 
+    # مرتب‌سازی باعث می‌شود
+    # تفاوت جزئی ترتیب کلمات هم
+    # باعث عبور خبر تکراری نشود.
+    words = sorted(
+        set(words)
+    )
+
     return " ".join(
-        words[:25]
+        words[:30]
     )
 
 
-def dedupe_items(items):
+def title_tokens(title):
+    fingerprint = title_fingerprint(
+        title
+    )
+
+    return set(
+        fingerprint.split()
+    )
+
+
+def titles_are_similar(
+    title1,
+    title2,
+    threshold=0.72
+):
+    tokens1 = title_tokens(
+        title1
+    )
+
+    tokens2 = title_tokens(
+        title2
+    )
+
+    if not tokens1 or not tokens2:
+        return False
+
+    intersection = len(
+        tokens1 & tokens2
+    )
+
+    union = len(
+        tokens1 | tokens2
+    )
+
+    if union == 0:
+        return False
+
+    similarity = (
+        intersection
+        / union
+    )
+
+    return similarity >= threshold
+
+
+# ============================================================
+# DEDUPLICATION
+# ============================================================
+
+def dedupe_items(
+    items,
+    sent_links,
+    sent_titles
+):
     result = []
+
     seen_urls = set()
     seen_titles = set()
 
+    # خبرهای با امتیاز بالاتر
+    # زودتر بررسی می‌شوند.
     items = sorted(
         items,
         key=lambda x: (
@@ -1583,6 +1739,7 @@ def dedupe_items(items):
     )
 
     for item in items:
+
         url = canonical_url(
             item.get(
                 "url",
@@ -1590,15 +1747,48 @@ def dedupe_items(items):
             )
         )
 
-        fingerprint = title_fingerprint(
+        title = clean_html(
             item.get(
                 "title",
                 ""
             )
         )
 
-        if not url:
+        if not url or not title:
             continue
+
+        # ----------------------------------------------------
+        # لینک قبلاً ارسال شده
+        # ----------------------------------------------------
+
+        if url in sent_links:
+            log.info(
+                "DUPLICATE LINK | %s",
+                title
+            )
+            continue
+
+        # ----------------------------------------------------
+        # عنوان قبلاً ارسال شده
+        # ----------------------------------------------------
+
+        fingerprint = title_fingerprint(
+            title
+        )
+
+        if (
+            fingerprint
+            and fingerprint in sent_titles
+        ):
+            log.info(
+                "DUPLICATE TITLE HISTORY | %s",
+                title
+            )
+            continue
+
+        # ----------------------------------------------------
+        # تکراری داخل همین اجرای Bot
+        # ----------------------------------------------------
 
         if url in seen_urls:
             continue
@@ -1607,27 +1797,65 @@ def dedupe_items(items):
             fingerprint
             and fingerprint in seen_titles
         ):
+            log.info(
+                "DUPLICATE CURRENT RUN | %s",
+                title
+            )
             continue
 
-        seen_urls.add(url)
+        # ----------------------------------------------------
+        # شباهت عنوان با خبرهای همین اجرا
+        # ----------------------------------------------------
+
+        similar = False
+
+        for old_item in result:
+            old_title = old_item.get(
+                "title",
+                ""
+            )
+
+            if titles_are_similar(
+                title,
+                old_title,
+                threshold=0.72
+            ):
+                log.info(
+                    "SIMILAR NEWS | %s | %s",
+                    title,
+                    old_title
+                )
+
+                similar = True
+                break
+
+        if similar:
+            continue
+
+        seen_urls.add(
+            url
+        )
 
         if fingerprint:
             seen_titles.add(
                 fingerprint
             )
 
-        result.append(item)
+        result.append(
+            item
+        )
 
     return result
 
 
 # ============================================================
-# COLLECT SOURCE
+# COLLECT
 # ============================================================
 
 def collect_from_source(
     source,
-    sent_links
+    sent_links,
+    sent_titles
 ):
     items = []
 
@@ -1641,26 +1869,26 @@ def collect_from_source(
                 source,
                 feed_url
             )
+
+            if rss_items:
+                items.extend(
+                    rss_items
+                )
+                break
+
         except Exception as e:
             log.debug(
                 "RSS error | %s | %s",
                 source["name"],
                 e
             )
-            continue
-
-        if rss_items:
-            items.extend(
-                rss_items
-            )
-            break
 
     if not items:
         items = scrape_homepage(
             source
         )
 
-    fresh_items = []
+    fresh = []
 
     for item in items:
         url = canonical_url(
@@ -1670,19 +1898,37 @@ def collect_from_source(
             )
         )
 
+        title = item.get(
+            "title",
+            ""
+        )
+
         if not url:
             continue
 
         if url in sent_links:
             continue
 
-        fresh_items.append(item)
+        fingerprint = title_fingerprint(
+            title
+        )
 
-    return fresh_items
+        if (
+            fingerprint
+            and fingerprint in sent_titles
+        ):
+            continue
+
+        fresh.append(
+            item
+        )
+
+    return fresh
 
 
 def collect_all_news(
-    sent_links
+    sent_links,
+    sent_titles
 ):
     all_items = []
 
@@ -1695,7 +1941,8 @@ def collect_all_news(
 
             items = collect_from_source(
                 source,
-                sent_links
+                sent_links,
+                sent_titles
             )
 
             log.info(
@@ -1733,13 +1980,15 @@ def enrich_candidates(items):
         if quick["score"] < 5:
             continue
 
-        candidates.append(item)
+        candidates.append(
+            item
+        )
 
     candidates.sort(
         key=lambda x: (
-            calculate_score(x)[
-                "score"
-            ],
+            calculate_score(
+                x
+            )["score"],
             -age_hours(
                 x.get(
                     "published"
@@ -1759,8 +2008,12 @@ def enrich_candidates(items):
                 item
             )
 
-            if is_relevant(item):
-                result.append(item)
+            if is_relevant(
+                item
+            ):
+                result.append(
+                    item
+                )
 
         except Exception as e:
             log.debug(
@@ -1775,6 +2028,32 @@ def enrich_candidates(items):
 # ============================================================
 # IMAGE
 # ============================================================
+
+def find_logo_file():
+    candidates = [
+        LOGO_FILE,
+        os.path.join(
+            BASE_DIR,
+            "logo.png"
+        ),
+        os.path.join(
+            BASE_DIR,
+            "logo.jpg"
+        ),
+        os.path.join(
+            BASE_DIR,
+            "logo.jpeg"
+        ),
+    ]
+
+    for path in candidates:
+        if os.path.isfile(
+            path
+        ):
+            return path
+
+    return None
+
 
 def download_image(url):
     if not url:
@@ -1822,11 +2101,6 @@ def download_image(url):
             )
         )
     ):
-        log.warning(
-            "NOT AN IMAGE | %s | %s",
-            url,
-            content_type
-        )
         return None
 
     if len(
@@ -1838,29 +2112,27 @@ def download_image(url):
         )
         return None
 
-    log.info(
-        "IMAGE DOWNLOADED | %s | %d bytes",
-        url,
-        len(response.content)
-    )
-
     return response.content
 
 
-def watermark_image(image_bytes):
+def watermark_image(
+    image_bytes
+):
     if not image_bytes:
         return image_bytes
 
     if Image is None:
         log.error(
-            "Pillow is not available. Logo cannot be added."
+            "Pillow is not installed."
         )
         return image_bytes
 
-    if not os.path.isfile(LOGO_FILE):
+    logo_path = find_logo_file()
+
+    if not logo_path:
         log.error(
-            "LOGO FILE NOT FOUND | %s",
-            LOGO_FILE
+            "LOGO NOT FOUND | searched in %s",
+            BASE_DIR
         )
         return image_bytes
 
@@ -1869,27 +2141,34 @@ def watermark_image(image_bytes):
 
         base = Image.open(
             BytesIO(image_bytes)
-        ).convert("RGBA")
+        ).convert(
+            "RGBA"
+        )
 
         logo = Image.open(
-            LOGO_FILE
-        ).convert("RGBA")
+            logo_path
+        ).convert(
+            "RGBA"
+        )
 
-        if logo.width <= 0 or logo.height <= 0:
-            log.error(
-                "INVALID LOGO SIZE | %s",
-                LOGO_FILE
-            )
+        if (
+            logo.width <= 0
+            or logo.height <= 0
+        ):
             return image_bytes
 
         target_width = max(
             140,
-            int(base.width * 0.22)
+            int(
+                base.width * 0.22
+            )
         )
 
         target_width = min(
             target_width,
-            int(base.width * 0.35)
+            int(
+                base.width * 0.35
+            )
         )
 
         ratio = (
@@ -1912,6 +2191,7 @@ def watermark_image(image_bytes):
             Image.LANCZOS
         )
 
+        # کمی شفاف‌تر تا عکس اصلی دیده شود.
         alpha = logo.getchannel(
             "A"
         )
@@ -1922,7 +2202,9 @@ def watermark_image(image_bytes):
             )
         )
 
-        logo.putalpha(alpha)
+        logo.putalpha(
+            alpha
+        )
 
         margin = max(
             15,
@@ -1945,7 +2227,10 @@ def watermark_image(image_bytes):
 
         base.alpha_composite(
             logo,
-            (x, y)
+            (
+                x,
+                y
+            )
         )
 
         output = BytesIO()
@@ -1962,12 +2247,8 @@ def watermark_image(image_bytes):
         result = output.getvalue()
 
         log.info(
-            "LOGO ADDED | file=%s | image=%sx%s | logo=%sx%s",
-            LOGO_FILE,
-            base.width,
-            base.height,
-            logo.width,
-            logo.height
+            "LOGO ADDED | %s",
+            logo_path
         )
 
         return result
@@ -1992,7 +2273,7 @@ def telegram_api(
 ):
     if not BOT_TOKEN:
         raise RuntimeError(
-            "BOT_TOKEN is not set"
+            "BOT_TOKEN is not set."
         )
 
     url = (
@@ -2003,14 +2284,12 @@ def telegram_api(
     )
 
     try:
-        response = requests.post(
+        return requests.post(
             url,
             data=data,
             files=files,
             timeout=30
         )
-
-        return response
 
     except requests.RequestException as e:
         log.error(
@@ -2021,15 +2300,14 @@ def telegram_api(
 
 
 def send_message(text):
-    data = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": "false",
-    }
-
     response = telegram_api(
         "sendMessage",
-        data=data
+        data={
+            "chat_id": CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "false",
+        }
     )
 
     if not response:
@@ -2037,7 +2315,7 @@ def send_message(text):
 
     if not response.ok:
         log.error(
-            "Telegram sendMessage failed | %s",
+            "sendMessage failed | %s",
             response.text[:500]
         )
         return False
@@ -2079,7 +2357,7 @@ def send_photo(
 
     if not response.ok:
         log.error(
-            "Telegram sendPhoto failed | %s",
+            "sendPhoto failed | %s",
             response.text[:500]
         )
         return False
@@ -2129,31 +2407,15 @@ def build_caption(item):
             "در لینک خبر."
         )
 
-    safe_title = html.escape(
-        title
-    )
-
-    safe_summary = html.escape(
-        summary
-    )
-
-    safe_source = html.escape(
-        source
-    )
-
-    safe_url = html.escape(
-        url,
-        quote=True
-    )
-
     caption = (
         "🟥 <b>خبر فوری</b>\n\n"
-        f"<b>{safe_title}</b>\n\n"
-        f"{safe_summary}\n\n"
-        f"📰 منبع: <b>{safe_source}</b>\n"
-        f"🔗 <a href=\"{safe_url}\">"
-        "مشاهده خبر اصلی"
-        "</a>\n\n"
+        f"<b>{html.escape(title)}</b>\n\n"
+        f"{html.escape(summary)}\n\n"
+        f"📰 منبع: "
+        f"<b>{html.escape(source)}</b>\n"
+        f"🔗 <a href=\""
+        f"{html.escape(url, quote=True)}"
+        f"\">مشاهده خبر اصلی</a>\n\n"
         "— @jahantab_news"
     )
 
@@ -2163,32 +2425,23 @@ def build_caption(item):
             300
         )
 
-        safe_summary = html.escape(
-            summary
-        )
-
         caption = (
             "🟥 <b>خبر فوری</b>\n\n"
-            f"<b>{safe_title}</b>\n\n"
-            f"{safe_summary}\n\n"
-            f"📰 منبع: <b>{safe_source}</b>\n"
-            f"🔗 <a href=\"{safe_url}\">"
-            "خبر اصلی"
-            "</a>\n\n"
+            f"<b>{html.escape(title)}</b>\n\n"
+            f"{html.escape(summary)}\n\n"
+            f"📰 منبع: "
+            f"<b>{html.escape(source)}</b>\n"
+            f"🔗 <a href=\""
+            f"{html.escape(url, quote=True)}"
+            f"\">خبر اصلی</a>\n\n"
             "— @jahantab_news"
         )
 
-    if len(caption) > 1024:
-        caption = (
-            caption[:1000]
-            + "…"
-        )
-
-    return caption
+    return caption[:1024]
 
 
 # ============================================================
-# SELECT
+# FINAL SELECTION
 # ============================================================
 
 def final_sort_key(item):
@@ -2215,9 +2468,15 @@ def final_sort_key(item):
     )
 
 
-def select_best(items):
+def select_best(
+    items,
+    sent_links,
+    sent_titles
+):
     items = dedupe_items(
-        items
+        items,
+        sent_links,
+        sent_titles
     )
 
     items.sort(
@@ -2244,22 +2503,20 @@ def main():
     )
 
     log.info(
-        "=" * 70
-    )
-
-    log.info(
         "BASE DIR | %s",
         BASE_DIR
     )
 
     log.info(
-        "LOGO FILE | %s",
-        LOGO_FILE
+        "CHAT ID | %s",
+        CHAT_ID
     )
 
+    logo = find_logo_file()
+
     log.info(
-        "LOGO EXISTS | %s",
-        os.path.isfile(LOGO_FILE)
+        "LOGO | %s",
+        logo or "NOT FOUND"
     )
 
     if not BOT_TOKEN:
@@ -2267,39 +2524,49 @@ def main():
             "BOT_TOKEN environment variable is missing."
         )
 
-    if not CHAT_ID:
-        raise RuntimeError(
-            "CHAT_ID environment variable is missing."
-        )
-
     sent_links = load_sent_links()
+    sent_titles = load_sent_titles()
 
     log.info(
-        "Sent links: %d",
+        "SENT LINKS | %d",
         len(sent_links)
     )
 
+    log.info(
+        "SENT TITLES | %d",
+        len(sent_titles)
+    )
+
+    # --------------------------------------------------------
+    # جمع‌آوری
+    # --------------------------------------------------------
+
     candidates = collect_all_news(
-        sent_links
+        sent_links,
+        sent_titles
     )
 
     log.info(
-        "TOTAL RAW CANDIDATES: %d",
+        "RAW CANDIDATES | %d",
         len(candidates)
     )
 
     if not candidates:
         log.info(
-            "NO CANDIDATES"
+            "NO NEW CANDIDATES"
         )
         return
+
+    # --------------------------------------------------------
+    # استخراج اطلاعات کامل خبر
+    # --------------------------------------------------------
 
     relevant = enrich_candidates(
         candidates
     )
 
     log.info(
-        "RELEVANT CANDIDATES: %d",
+        "RELEVANT | %d",
         len(relevant)
     )
 
@@ -2309,26 +2576,86 @@ def main():
         )
         return
 
+    # --------------------------------------------------------
+    # حذف تکراری
+    # --------------------------------------------------------
+
     selected = select_best(
-        relevant
+        relevant,
+        sent_links,
+        sent_titles
+    )
+
+    log.info(
+        "SELECTED | %d",
+        len(selected)
     )
 
     if not selected:
         log.info(
-            "NO NEWS SELECTED"
+            "NOTHING NEW TO PUBLISH"
         )
         return
+
+    # --------------------------------------------------------
+    # ارسال
+    # --------------------------------------------------------
 
     sent_count = 0
 
     for item in selected:
+
         try:
+            title = item.get(
+                "title",
+                ""
+            )
+
+            url = item.get(
+                "url",
+                ""
+            )
+
             log.info(
-                "SELECTED | score=%s | source=%s | title=%s",
+                "PUBLISH | score=%s | source=%s | title=%s",
                 item.get("score"),
                 item.get("source"),
-                item.get("title")
+                title
             )
+
+            # یک بررسی نهایی درست قبل از ارسال
+            current_sent_links = (
+                load_sent_links()
+            )
+
+            current_sent_titles = (
+                load_sent_titles()
+            )
+
+            if (
+                canonical_url(url)
+                in current_sent_links
+            ):
+                log.info(
+                    "SKIP - ALREADY SENT | %s",
+                    title
+                )
+                continue
+
+            fingerprint = title_fingerprint(
+                title
+            )
+
+            if (
+                fingerprint
+                and fingerprint
+                in current_sent_titles
+            ):
+                log.info(
+                    "SKIP - TITLE ALREADY SENT | %s",
+                    title
+                )
+                continue
 
             caption = build_caption(
                 item
@@ -2344,11 +2671,6 @@ def main():
                 )
 
             if image_bytes:
-                log.info(
-                    "ADDING LOGO | %s",
-                    item.get("title")
-                )
-
                 image_bytes = watermark_image(
                     image_bytes
                 )
@@ -2359,25 +2681,23 @@ def main():
                 )
 
             else:
-                log.info(
-                    "NO IMAGE | sending text only | %s",
-                    item.get("title")
-                )
-
                 success = send_message(
                     caption
                 )
 
+            # فقط اگر Telegram موفق بود
+            # خبر به عنوان ارسال‌شده ثبت می‌شود.
             if success:
-                save_sent_link(
-                    item["url"]
-                )
 
-                sent_count += 1
+                if save_sent_item(
+                    url,
+                    title
+                ):
+                    sent_count += 1
 
                 log.info(
-                    "PUBLISHED | %s",
-                    item["url"]
+                    "PUBLISHED SUCCESSFULLY | %s",
+                    url
                 )
 
                 time.sleep(2)
@@ -2385,7 +2705,7 @@ def main():
             else:
                 log.error(
                     "PUBLISH FAILED | %s",
-                    item["url"]
+                    url
                 )
 
         except Exception as e:
@@ -2396,12 +2716,12 @@ def main():
             )
 
     log.info(
-        "PUBLISHED TOTAL: %d",
-        sent_count
+        "=" * 70
     )
 
     log.info(
-        "=" * 70
+        "PUBLISHED TOTAL | %d",
+        sent_count
     )
 
     log.info(
