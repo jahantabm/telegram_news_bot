@@ -2,16 +2,13 @@
 
 """
 JAHANTAB Telegram News Bot
+
 هدف:
-فقط خبرهای فوری و مهم درباره جنگ ایران و درگیری‌های مرتبط با منطقه
+فقط خبرهای فوری و مهم درباره جنگ ایران
+و درگیری‌های مرتبط با منطقه
 
-بدون:
-- OpenAI
-- ترجمه
-- Google News
-- منابع خارجی
-
-دارای:
+ویژگی‌ها:
+- منابع فارسی
 - RSS
 - HTML fallback
 - استخراج عنوان، خلاصه و عکس
@@ -19,7 +16,9 @@ JAHANTAB Telegram News Bot
 - امتیاز اهمیت و فوریت
 - حذف خبرهای تکراری
 - حذف مطالب تحلیلی و غیرمرتبط
+- افزودن لوگوی JAHANTAB روی عکس
 - ارسال عکس + کپشن به Telegram
+- امکان کپی متن کپشن و لینک خبر
 """
 
 import os
@@ -58,14 +57,24 @@ MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "3"))
 MAX_ITEMS_PER_SOURCE = int(os.getenv("MAX_ITEMS_PER_SOURCE", "12"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 
-SENT_FILE = os.getenv(
-    "SENT_FILE",
-    "sent_links.txt"
+BASE_DIR = os.path.dirname(
+    os.path.abspath(__file__)
 )
 
-LOGO_FILE = os.getenv(
-    "LOGO_FILE",
-    "logo.jpg"
+SENT_FILE = os.path.join(
+    BASE_DIR,
+    os.getenv(
+        "SENT_FILE",
+        "sent_links.txt"
+    )
+)
+
+LOGO_FILE = os.path.join(
+    BASE_DIR,
+    os.getenv(
+        "LOGO_FILE",
+        "logo.jpg"
+    )
 )
 
 
@@ -251,6 +260,11 @@ SOURCES = [
         "name": "آخرین خبر",
         "domain": "akharinkhabar.ir",
         "url": "https://akharinkhabar.ir/",
+    },
+    {
+        "name": "روزپلاس",
+        "domain": "roozplus.com",
+        "url": "https://roozplus.com/",
     },
 ]
 
@@ -1375,12 +1389,8 @@ def calculate_score(item):
     matched_major = []
     matched_urgent = []
 
-    # ----------------------------
-    # ENTITIES
-    # ----------------------------
-
     for phrase, value in CORE_ENTITIES.items():
-        if phrase in text:
+        if normalize_text(phrase) in text:
             score += value
             matched_entities.append(
                 phrase
@@ -1395,66 +1405,38 @@ def calculate_score(item):
             "urgent": [],
         }
 
-    # ----------------------------
-    # MILITARY ACTIONS
-    # ----------------------------
-
     for phrase, value in MILITARY_ACTIONS.items():
-        if phrase in text:
+        if normalize_text(phrase) in text:
             score += value
             matched_actions.append(
                 phrase
             )
 
-    # ----------------------------
-    # MAJOR EVENTS
-    # ----------------------------
-
     for phrase, value in MAJOR_EVENTS.items():
-        if phrase in text:
+        if normalize_text(phrase) in text:
             score += value
             matched_major.append(
                 phrase
             )
 
-    # ----------------------------
-    # URGENCY
-    # ----------------------------
-
     for phrase, value in URGENT_TERMS.items():
-        if phrase in text:
+        if normalize_text(phrase) in text:
             score += value
             matched_urgent.append(
                 phrase
             )
 
-    # ----------------------------
-    # CASUALTIES
-    # ----------------------------
-
     for phrase, value in CASUALTY_TERMS.items():
-        if phrase in text:
+        if normalize_text(phrase) in text:
             score += value
-
-    # ----------------------------
-    # ANALYSIS
-    # ----------------------------
 
     for phrase, value in ANALYSIS_TERMS.items():
-        if phrase in text:
+        if normalize_text(phrase) in text:
             score += value
-
-    # ----------------------------
-    # EXCLUDE
-    # ----------------------------
 
     for phrase, value in EXCLUDE_TERMS.items():
-        if phrase in text:
+        if normalize_text(phrase) in text:
             score += value
-
-    # ----------------------------
-    # EVENT REQUIREMENT
-    # ----------------------------
 
     if (
         not matched_actions
@@ -1462,12 +1444,8 @@ def calculate_score(item):
     ):
         score -= 25
 
-    # ----------------------------
-    # ANALYSIS EXTRA PENALTY
-    # ----------------------------
-
     analysis_found = any(
-        phrase in text
+        normalize_text(phrase) in text
         for phrase in [
             "تحلیل",
             "یادداشت",
@@ -1485,10 +1463,6 @@ def calculate_score(item):
         and len(matched_actions) < 2
     ):
         score -= 15
-
-    # ----------------------------
-    # FRESHNESS
-    # ----------------------------
 
     hours = age_hours(
         item.get(
@@ -1657,10 +1631,6 @@ def collect_from_source(
 ):
     items = []
 
-    # ----------------------------
-    # RSS
-    # ----------------------------
-
     feeds = discover_feeds(
         source
     )
@@ -1685,18 +1655,10 @@ def collect_from_source(
             )
             break
 
-    # ----------------------------
-    # HTML FALLBACK
-    # ----------------------------
-
     if not items:
         items = scrape_homepage(
             source
         )
-
-    # ----------------------------
-    # SENT FILTER
-    # ----------------------------
 
     fresh_items = []
 
@@ -1835,6 +1797,10 @@ def download_image(url):
     )
 
     if not response or not response.ok:
+        log.warning(
+            "IMAGE DOWNLOAD FAILED | %s",
+            url
+        )
         return None
 
     content_type = (
@@ -1856,25 +1822,46 @@ def download_image(url):
             )
         )
     ):
+        log.warning(
+            "NOT AN IMAGE | %s | %s",
+            url,
+            content_type
+        )
         return None
 
     if len(
         response.content
     ) > 15 * 1024 * 1024:
+        log.warning(
+            "IMAGE TOO LARGE | %s",
+            url
+        )
         return None
+
+    log.info(
+        "IMAGE DOWNLOADED | %s | %d bytes",
+        url,
+        len(response.content)
+    )
 
     return response.content
 
 
-def watermark_image(
-    image_bytes
-):
-    if (
-        Image is None
-        or not os.path.exists(
+def watermark_image(image_bytes):
+    if not image_bytes:
+        return image_bytes
+
+    if Image is None:
+        log.error(
+            "Pillow is not available. Logo cannot be added."
+        )
+        return image_bytes
+
+    if not os.path.isfile(LOGO_FILE):
+        log.error(
+            "LOGO FILE NOT FOUND | %s",
             LOGO_FILE
         )
-    ):
         return image_bytes
 
     try:
@@ -1888,11 +1875,21 @@ def watermark_image(
             LOGO_FILE
         ).convert("RGBA")
 
-        target_width = max(
-            100,
-            int(
-                base.width * 0.18
+        if logo.width <= 0 or logo.height <= 0:
+            log.error(
+                "INVALID LOGO SIZE | %s",
+                LOGO_FILE
             )
+            return image_bytes
+
+        target_width = max(
+            140,
+            int(base.width * 0.22)
+        )
+
+        target_width = min(
+            target_width,
+            int(base.width * 0.35)
         )
 
         ratio = (
@@ -1921,16 +1918,16 @@ def watermark_image(
 
         alpha = alpha.point(
             lambda p: int(
-                p * 0.85
+                p * 0.90
             )
         )
 
         logo.putalpha(alpha)
 
         margin = max(
-            10,
+            15,
             int(
-                base.width * 0.015
+                base.width * 0.025
             )
         )
 
@@ -1958,15 +1955,26 @@ def watermark_image(
         ).save(
             output,
             format="JPEG",
-            quality=90,
+            quality=95,
             optimize=True
         )
 
-        return output.getvalue()
+        result = output.getvalue()
+
+        log.info(
+            "LOGO ADDED | file=%s | image=%sx%s | logo=%sx%s",
+            LOGO_FILE,
+            base.width,
+            base.height,
+            logo.width,
+            logo.height
+        )
+
+        return result
 
     except Exception as e:
-        log.debug(
-            "Watermark failed | %s",
+        log.exception(
+            "WATERMARK ERROR | %s",
             e
         )
 
@@ -2146,7 +2154,7 @@ def build_caption(item):
         f"🔗 <a href=\"{safe_url}\">"
         "مشاهده خبر اصلی"
         "</a>\n\n"
-        "— JAHANTAB"
+        "— @jahantab_news"
     )
 
     if len(caption) > 1024:
@@ -2167,7 +2175,7 @@ def build_caption(item):
             f"🔗 <a href=\"{safe_url}\">"
             "خبر اصلی"
             "</a>\n\n"
-            "— JAHANTAB"
+            "— @jahantab_news"
         )
 
     if len(caption) > 1024:
@@ -2239,6 +2247,21 @@ def main():
         "=" * 70
     )
 
+    log.info(
+        "BASE DIR | %s",
+        BASE_DIR
+    )
+
+    log.info(
+        "LOGO FILE | %s",
+        LOGO_FILE
+    )
+
+    log.info(
+        "LOGO EXISTS | %s",
+        os.path.isfile(LOGO_FILE)
+    )
+
     if not BOT_TOKEN:
         raise RuntimeError(
             "BOT_TOKEN environment variable is missing."
@@ -2256,10 +2279,6 @@ def main():
         len(sent_links)
     )
 
-    # --------------------------------
-    # Collect
-    # --------------------------------
-
     candidates = collect_all_news(
         sent_links
     )
@@ -2274,10 +2293,6 @@ def main():
             "NO CANDIDATES"
         )
         return
-
-    # --------------------------------
-    # Enrich
-    # --------------------------------
 
     relevant = enrich_candidates(
         candidates
@@ -2294,10 +2309,6 @@ def main():
         )
         return
 
-    # --------------------------------
-    # Select
-    # --------------------------------
-
     selected = select_best(
         relevant
     )
@@ -2307,10 +2318,6 @@ def main():
             "NO NEWS SELECTED"
         )
         return
-
-    # --------------------------------
-    # Publish
-    # --------------------------------
 
     sent_count = 0
 
@@ -2337,6 +2344,11 @@ def main():
                 )
 
             if image_bytes:
+                log.info(
+                    "ADDING LOGO | %s",
+                    item.get("title")
+                )
+
                 image_bytes = watermark_image(
                     image_bytes
                 )
@@ -2347,6 +2359,11 @@ def main():
                 )
 
             else:
+                log.info(
+                    "NO IMAGE | sending text only | %s",
+                    item.get("title")
+                )
+
                 success = send_message(
                     caption
                 )
