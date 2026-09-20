@@ -3,15 +3,16 @@ import re
 import time
 import html
 import requests
-import feedparser
+
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from openai import OpenAI
-from googlenewsdecoder import gnewsdecoder
 
-# ============================================================
-# JAHANTAB TELEGRAM NEWS BOT
-# ============================================================
+from googlenewsdecoder import (
+    gnewsdecoder,
+    decoderv1,
+    decoderv2,
+)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL = os.getenv("CHANNEL", "@jahantab_news")
@@ -21,9 +22,18 @@ LOGO_FILE = "jahantab_logo_transparent-1.png"
 FALLBACK_FILE = "fallback_news.jpg"
 SENT_FILE = "sent_links.txt"
 
-# ------------------------------------------------------------
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 Chrome/140 Safari/537.36"
+)
+
+session = requests.Session()
+session.headers.update({"User-Agent": USER_AGENT})
+
+
+# ============================================================
 # منابع مجاز
-# ------------------------------------------------------------
+# ============================================================
 
 SOURCES = {
     "reuters.com": "Reuters",
@@ -44,18 +54,19 @@ SOURCES = {
     "hamshahrionline.ir": "Hamshahri",
 }
 
-# ------------------------------------------------------------
-# موضوعات موردنظر
-# ------------------------------------------------------------
+
+# ============================================================
+# موضوعات
+# ============================================================
 
 QUERIES = [
     "Iran OR ایران",
-    "Iran Iraq OR ایران عراق",
     "Iran Israel OR ایران اسرائیل",
-    "Gaza Palestine Hamas OR غزه فلسطین حماس",
-    "Hezbollah Lebanon OR حزب الله لبنان",
-    "Yemen Houthis Ansar Allah OR یمن انصارالله",
     "Iran US OR ایران آمریکا",
+    "Iran Iraq OR ایران عراق",
+    "Gaza Hamas Palestine OR غزه حماس فلسطین",
+    "Hezbollah Lebanon OR حزب الله لبنان",
+    "Yemen Houthis OR یمن حوثی",
     "Middle East war OR جنگ خاورمیانه",
 ]
 
@@ -63,48 +74,38 @@ KEYWORDS = [
     "iran", "iranian", "ایران", "ایرانی",
     "iraq", "iraqi", "عراق",
     "hashd", "pmu", "حشد",
-    "lebanon", "lebanese", "لبنان",
-    "hezbollah", "حزب الله",
-    "palestine", "palestinian", "فلسطین",
+    "lebanon", "لبنان",
+    "hezbollah", "حزب الله", "حزب‌الله",
+    "palestine", "فلسطین",
     "gaza", "غزه",
     "hamas", "حماس",
     "yemen", "یمن",
     "houthi", "houthis", "حوثی",
     "ansar allah", "انصارالله",
     "israel", "israeli", "اسرائیل",
-    "united states", "u.s.", "usa", "america",
+    "america", "american", "usa", "u.s.",
     "آمریکا", "ایالات متحده",
     "war", "جنگ",
     "attack", "attacks", "حمله",
-    "strike", "strikes", "حمله هوایی",
+    "strike", "strikes",
     "missile", "missiles", "موشک",
     "rocket", "راکت",
     "drone", "پهپاد",
     "explosion", "انفجار",
     "ceasefire", "آتش بس", "آتش‌بس",
-    "negotiation", "مذاکرات",
     "nuclear", "هسته ای", "هسته‌ای",
-    "sanctions", "تحریم",
-    "killed", "کشته",
-    "death", "مرگ",
     "military", "نظامی",
+    "killed", "کشته",
+    "sanctions", "تحریم",
     "conflict", "درگیری",
 ]
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 Chrome/140 Safari/537.36"
-)
-
-session = requests.Session()
-session.headers.update({"User-Agent": USER_AGENT})
-
 
 # ============================================================
-# ابزارها
+# ابزار
 # ============================================================
 
-def clean_text(text):
+def clean(text):
     if not text:
         return ""
 
@@ -115,63 +116,36 @@ def clean_text(text):
     return text.strip()
 
 
-def domain_of(url):
+def domain(url):
     try:
         return urlparse(url).netloc.lower().replace("www.", "")
     except Exception:
         return ""
 
 
-def allowed_source_from_domain(url):
-    domain = domain_of(url)
+def allowed_source(url):
+    d = domain(url)
 
     for allowed_domain, name in SOURCES.items():
-        if domain == allowed_domain or domain.endswith("." + allowed_domain):
+        if d == allowed_domain or d.endswith("." + allowed_domain):
             return name
 
     return None
 
 
-def allowed_source_from_rss(item):
-    source = item.find("source")
-
-    if source is None:
-        return None
-
-    source_name = clean_text(source.text)
-    source_url = source.get("url", "")
-
-    # اول از روی URL منبع تشخیص بده
-    if source_url:
-        detected = allowed_source_from_domain(source_url)
-
-        if detected:
-            return detected
-
-    # بعد از روی نام دقیق منبع
-    source_lower = source_name.lower()
-
-    for allowed_domain, name in SOURCES.items():
-        if source_lower == name.lower():
-            return name
-
-    return None
-
-
-def is_relevant(title, description=""):
+def relevant(title, description):
     text = f"{title} {description}".lower()
 
-    for keyword in KEYWORDS:
-        if keyword.lower() in text:
-            return True
+    return any(
+        word.lower() in text
+        for word in KEYWORDS
+    )
 
-    return False
 
-
-def urgency_score(title, description=""):
+def urgency(title, description):
     text = f"{title} {description}".lower()
 
-    urgent = [
+    words = [
         "breaking",
         "urgent",
         "war",
@@ -185,26 +159,27 @@ def urgency_score(title, description=""):
         "ceasefire",
         "nuclear",
         "military",
-        "حمله",
         "جنگ",
+        "حمله",
         "موشک",
         "پهپاد",
         "انفجار",
         "کشته",
         "فوری",
-        "مهم",
         "آتش‌بس",
         "آتش بس",
         "هسته‌ای",
-        "هسته ای",
         "نظامی",
     ]
 
-    return sum(1 for word in urgent if word.lower() in text)
+    return sum(
+        1 for word in words
+        if word.lower() in text
+    )
 
 
 # ============================================================
-# خبرهای قبلی
+# خبرهای ارسال شده
 # ============================================================
 
 def load_sent():
@@ -212,127 +187,241 @@ def load_sent():
         return set()
 
     try:
-        with open(SENT_FILE, "r", encoding="utf-8") as f:
+        with open(
+            SENT_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
             return {
-                line.strip()
-                for line in f
-                if line.strip()
+                x.strip()
+                for x in f
+                if x.strip()
             }
+
     except Exception:
         return set()
 
 
-def save_sent(sent):
-    with open(SENT_FILE, "w", encoding="utf-8") as f:
-        for url in sorted(sent):
-            f.write(url + "\n")
+def save_sent(items):
+    with open(
+        SENT_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        for item in sorted(items):
+            f.write(item + "\n")
 
 
 # ============================================================
-# Google News → لینک مستقیم
+# تشخیص منبع RSS
 # ============================================================
 
-def resolve_google_news(url):
-    if "news.google.com" not in url:
-        return url
+def rss_source(item):
 
-    print("Resolving Google News link...")
+    source = item.find("source")
 
-    try:
-        result = gnewsdecoder(url, interval=1)
+    if source is None:
+        return None
 
-        if isinstance(result, dict):
-            if result.get("status") and result.get("decoded_url"):
-                direct = result["decoded_url"]
+    source_url = source.get("url", "")
 
-                if "news.google.com" not in direct:
-                    print("Direct URL found:")
-                    print(direct)
-                    return direct
+    # اول URL منبع
+    if source_url:
+        detected = allowed_source(source_url)
 
-    except Exception as e:
-        print("Google News decoder error:", e)
+        if detected:
+            return detected
 
-    print("Could not decode Google News URL.")
+    # سپس نام منبع
+    source_name = clean(
+        source.get_text()
+    ).lower()
+
+    for _, name in SOURCES.items():
+
+        if source_name == name.lower():
+            return name
+
     return None
 
 
 # ============================================================
-# دریافت اطلاعات خبر
+# Google News → لینک واقعی
+# ============================================================
+
+def decode_google(url):
+
+    if "news.google.com" not in url:
+        return url
+
+    print("Trying Google News decoder...")
+
+    decoders = [
+        ("decoderv1", lambda: decoderv1(url)),
+        ("decoderv2", lambda: decoderv2(url)),
+        (
+            "gnewsdecoder",
+            lambda: gnewsdecoder(
+                url,
+                interval=1
+            )
+        ),
+    ]
+
+    for name, decoder in decoders:
+
+        try:
+
+            result = decoder()
+
+            if isinstance(result, str):
+                candidate = result
+
+            elif isinstance(result, dict):
+                candidate = result.get(
+                    "decoded_url"
+                )
+
+            else:
+                candidate = None
+
+            if (
+                candidate
+                and "news.google.com" not in candidate
+                and candidate.startswith("http")
+            ):
+                print(
+                    f"Decoded with {name}:"
+                )
+                print(candidate)
+
+                return candidate
+
+        except Exception as e:
+            print(
+                f"{name} failed:",
+                str(e)[:200]
+            )
+
+    print("ALL GOOGLE DECODERS FAILED")
+
+    return None
+
+
+# ============================================================
+# دریافت مقاله
 # ============================================================
 
 def get_article(url):
+
     try:
+
         response = session.get(
             url,
-            timeout=15,
+            timeout=20,
             allow_redirects=True,
         )
 
         if response.status_code >= 400:
-            print("Article HTTP error:", response.status_code)
+            print(
+                "Article HTTP:",
+                response.status_code
+            )
             return None
 
         final_url = response.url
 
-        # اگر دوباره Google News بود، معتبر نیست
         if "news.google.com" in final_url:
             return None
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        source = allowed_source(
+            final_url
+        )
 
-        def meta_content(property_name):
+        if not source:
+            print(
+                "Rejected source:",
+                domain(final_url)
+            )
+            return None
+
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser"
+        )
+
+        def meta(name):
+
             tag = soup.find(
                 "meta",
-                attrs={"property": property_name}
+                attrs={
+                    "property": name
+                }
             )
 
             if not tag:
                 tag = soup.find(
                     "meta",
-                    attrs={"name": property_name}
+                    attrs={
+                        "name": name
+                    }
                 )
 
             if tag:
-                return clean_text(tag.get("content", ""))
+                return clean(
+                    tag.get(
+                        "content",
+                        ""
+                    )
+                )
 
             return ""
 
         title = (
-            meta_content("og:title")
-            or meta_content("twitter:title")
+            meta("og:title")
+            or meta("twitter:title")
         )
 
         description = (
-            meta_content("og:description")
-            or meta_content("description")
-            or meta_content("twitter:description")
+            meta("og:description")
+            or meta("description")
+            or meta(
+                "twitter:description"
+            )
         )
 
         image = (
-            meta_content("og:image")
-            or meta_content("twitter:image")
+            meta("og:image")
+            or meta("twitter:image")
         )
 
-        # اگر عنوان متا نبود
         if not title and soup.title:
-            title = clean_text(soup.title.get_text())
+            title = clean(
+                soup.title.get_text()
+            )
 
-        # استخراج مقداری از متن مقاله
         paragraphs = []
 
         for p in soup.find_all("p"):
-            text = clean_text(p.get_text(" ", strip=True))
+
+            text = clean(
+                p.get_text(
+                    " ",
+                    strip=True
+                )
+            )
 
             if len(text) >= 40:
                 paragraphs.append(text)
 
-        article_text = " ".join(paragraphs)
-
-        article_text = article_text[:7000]
+        article_text = " ".join(
+            paragraphs
+        )[:7000]
 
         return {
             "url": final_url,
+            "source": source,
             "title": title,
             "description": description,
             "image": image,
@@ -340,7 +429,12 @@ def get_article(url):
         }
 
     except Exception as e:
-        print("Article extraction error:", e)
+
+        print(
+            "Article error:",
+            str(e)[:300]
+        )
+
         return None
 
 
@@ -348,11 +442,33 @@ def get_article(url):
 # تصویر
 # ============================================================
 
-def download_image(url, filename="news_image.jpg"):
+def download_image(url):
+
     if not url:
         return None
 
+    # هیچ تصویر Google را قبول نکن
+    image_domain = domain(url)
+
+    blocked = [
+        "google.com",
+        "googleusercontent.com",
+        "gstatic.com",
+        "googleapis.com",
+    ]
+
+    if any(
+        image_domain == x
+        or image_domain.endswith("." + x)
+        for x in blocked
+    ):
+        print(
+            "Google image rejected."
+        )
+        return None
+
     try:
+
         response = session.get(
             url,
             timeout=15,
@@ -370,26 +486,45 @@ def download_image(url, filename="news_image.jpg"):
         if "image" not in content_type:
             return None
 
-        with open(filename, "wb") as f:
-            for chunk in response.iter_content(8192):
+        filename = "news_original.jpg"
+
+        with open(
+            filename,
+            "wb"
+        ) as f:
+
+            for chunk in response.iter_content(
+                8192
+            ):
+
                 if chunk:
                     f.write(chunk)
 
         if os.path.getsize(filename) < 1000:
             return None
 
+        print(
+            "Original article image downloaded."
+        )
+
         return filename
 
     except Exception as e:
-        print("Image download error:", e)
+
+        print(
+            "Image error:",
+            str(e)[:200]
+        )
+
         return None
 
 
 # ============================================================
-# لوگو روی تصویر
+# لوگو
 # ============================================================
 
 def add_logo(image_file):
+
     if not image_file:
         return None
 
@@ -397,35 +532,68 @@ def add_logo(image_file):
         return image_file
 
     try:
+
         from PIL import Image
 
-        base = Image.open(image_file).convert("RGBA")
-        logo = Image.open(LOGO_FILE).convert("RGBA")
+        base = Image.open(
+            image_file
+        ).convert("RGBA")
 
-        # اندازه لوگو
-        max_width = int(base.width * 0.20)
+        logo = Image.open(
+            LOGO_FILE
+        ).convert("RGBA")
+
+        max_width = int(
+            base.width * 0.20
+        )
 
         if logo.width > max_width:
-            ratio = max_width / logo.width
+
+            ratio = (
+                max_width /
+                logo.width
+            )
+
             logo = logo.resize(
                 (
-                    int(logo.width * ratio),
-                    int(logo.height * ratio),
+                    int(
+                        logo.width *
+                        ratio
+                    ),
+                    int(
+                        logo.height *
+                        ratio
+                    ),
                 ),
                 Image.LANCZOS,
             )
 
-        # فاصله از لبه
-        margin = max(15, int(base.width * 0.025))
+        margin = max(
+            15,
+            int(
+                base.width *
+                0.025
+            )
+        )
 
-        x = base.width - logo.width - margin
+        x = (
+            base.width -
+            logo.width -
+            margin
+        )
+
         y = margin
 
-        base.alpha_composite(logo, (x, y))
+        base.alpha_composite(
+            logo,
+            (x, y)
+        )
 
-        output = "final_news_image.jpg"
+        output = "final_news.jpg"
 
-        base.convert("RGB").save(
+        base.convert(
+            "RGB"
+        ).save(
             output,
             "JPEG",
             quality=92,
@@ -434,200 +602,271 @@ def add_logo(image_file):
         return output
 
     except Exception as e:
-        print("Logo error:", e)
+
+        print(
+            "Logo error:",
+            str(e)[:200]
+        )
+
         return image_file
 
 
 # ============================================================
-# ساخت متن فارسی با OpenAI
+# ترجمه و خلاصه فارسی
 # ============================================================
 
-def make_persian_news(
-    original_title,
+def make_persian(
+    title,
     description,
     article_text,
-    source_name,
+    source
 ):
+
     if not OPENAI_API_KEY:
-        print("OPENAI_API_KEY is missing.")
         return None
 
     client = OpenAI(
         api_key=OPENAI_API_KEY
     )
 
-    context = (
-        f"عنوان اصلی:\n{original_title}\n\n"
-        f"توضیح:\n{description}\n\n"
-        f"متن خبر:\n{article_text}\n"
-    )
-
     prompt = f"""
-تو یک سردبیر خبر فارسی هستی.
+تو سردبیر یک کانال خبری فارسی هستی.
 
-خبر زیر را به فارسی روان، کوتاه و کاملاً خبری بازنویسی کن.
+خبر زیر را برای انتشار در تلگرام به فارسی روان تبدیل کن.
 
-منبع خبر: {source_name}
+منبع:
+{source}
+
+عنوان اصلی:
+{title}
+
+توضیح:
+{description}
+
+متن خبر:
+{article_text}
 
 قوانین:
-- عنوان را حتماً فارسی بنویس.
-- خلاصه را در 3 تا 4 جمله فارسی بنویس.
-- فقط اطلاعات موجود در متن را بیان کن.
-- هیچ اطلاعاتی را حدس نزن.
-- نظر شخصی، تبلیغات و تحلیل سیاسی اضافه نکن.
-- اگر موضوع هنوز قطعی نیست، با عباراتی مثل «به گزارش...» یا
-  «بر اساس گزارش...» بیان کن.
-- متن باید مناسب انتشار در کانال خبری تلگرام باشد.
+- عنوان حتماً فارسی باشد.
+- خلاصه دقیقاً 3 تا 4 جمله باشد.
+- هیچ اطلاعاتی اضافه یا حدس زده نشود.
+- لحن کاملاً خبری و خنثی باشد.
+- اگر خبر ادعا یا گزارش یک طرف است، آن را به عنوان ادعا/گزارش همان منبع بیان کن.
+- خروجی انگلیسی نباشد.
 
-فقط با این قالب پاسخ بده:
+فقط این قالب:
 
 TITLE:
 عنوان فارسی
 
 SUMMARY:
-خلاصه فارسی 3 تا 4 جمله‌ای
-
-خبر:
-{context}
+خلاصه فارسی
 """
 
     try:
+
         response = client.responses.create(
             model="gpt-5.6-luna",
             input=prompt,
             max_output_tokens=700,
         )
 
-        output = response.output_text.strip()
-
-        if not output:
-            return None
+        output = (
+            response.output_text
+            .strip()
+        )
 
         title_match = re.search(
             r"TITLE:\s*(.*?)(?:\n|$)",
             output,
-            re.IGNORECASE,
+            re.I,
         )
 
         summary_match = re.search(
             r"SUMMARY:\s*(.*)",
             output,
-            re.IGNORECASE | re.DOTALL,
+            re.I | re.S,
         )
 
-        if not title_match or not summary_match:
-            print("OpenAI output format invalid.")
+        if not title_match:
+            print(
+                "Persian title missing."
+            )
             return None
 
-        title = clean_text(title_match.group(1))
-        summary = clean_text(summary_match.group(1))
-
-        # حذف احتمالی بخش اضافه
-        summary = re.split(
-            r"\n(?:TITLE|SUMMARY|خبر):",
-            summary,
-            flags=re.IGNORECASE,
-        )[0].strip()
-
-        # حتماً فارسی باشد
-        if not re.search(r"[\u0600-\u06FF]", title):
-            print("Title is not Persian.")
+        if not summary_match:
+            print(
+                "Persian summary missing."
+            )
             return None
 
-        if not re.search(r"[\u0600-\u06FF]", summary):
-            print("Summary is not Persian.")
+        fa_title = clean(
+            title_match.group(1)
+        )
+
+        fa_summary = clean(
+            summary_match.group(1)
+        )
+
+        if not re.search(
+            r"[\u0600-\u06FF]",
+            fa_title
+        ):
+            print(
+                "Title is not Persian."
+            )
+            return None
+
+        if not re.search(
+            r"[\u0600-\u06FF]",
+            fa_summary
+        ):
+            print(
+                "Summary is not Persian."
+            )
             return None
 
         return {
-            "title": title,
-            "summary": summary,
+            "title": fa_title,
+            "summary": fa_summary,
         }
 
     except Exception as e:
-        status = getattr(e, "status_code", None)
 
-        if status == 429 or "429" in str(e):
-            print("OPENAI 429: Daily/request limit reached.")
-            print("News will NOT be published.")
+        if (
+            getattr(
+                e,
+                "status_code",
+                None
+            ) == 429
+            or "429" in str(e)
+        ):
+
+            print(
+                "OPENAI LIMIT REACHED."
+            )
 
         else:
-            print("OPENAI ERROR:", e)
+
+            print(
+                "OPENAI ERROR:",
+                str(e)[:300]
+            )
 
         return None
 
 
 # ============================================================
-# ارسال به تلگرام
+# ارسال تلگرام
 # ============================================================
 
-def send_photo(photo, caption):
-    url = (
+def send_photo(
+    image,
+    title,
+    summary,
+    source,
+    url
+):
+
+    api = (
         f"https://api.telegram.org/bot"
         f"{BOT_TOKEN}/sendPhoto"
     )
 
+    # لینک بلند در متن نمایش داده نمی‌شود
+    link = (
+        f'<a href="{html.escape(url)}">'
+        f"🔗 مشاهده خبر اصلی"
+        f"</a>"
+    )
+
+    caption = (
+        f"📰 <b>{html.escape(title)}</b>\n\n"
+        f"{html.escape(summary)}\n\n"
+        f"منبع: {html.escape(source)}\n"
+        f"{link}"
+    )
+
+    # محدودیت کپشن تلگرام
+    if len(caption) > 1024:
+
+        allowed = (
+            1024 -
+            len(
+                f"📰 <b>{html.escape(title)}</b>\n\n"
+                f"\n\nمنبع: {html.escape(source)}\n"
+                f"{link}"
+            )
+        )
+
+        summary = summary[:max(
+            100,
+            allowed
+        )]
+
+        caption = (
+            f"📰 <b>{html.escape(title)}</b>\n\n"
+            f"{html.escape(summary)}\n\n"
+            f"منبع: {html.escape(source)}\n"
+            f"{link}"
+        )
+
     try:
-        with open(photo, "rb") as f:
+
+        with open(
+            image,
+            "rb"
+        ) as photo:
+
             response = requests.post(
-                url,
+                api,
                 data={
                     "chat_id": CHANNEL,
                     "caption": caption,
+                    "parse_mode": "HTML",
                 },
                 files={
-                    "photo": f,
+                    "photo": photo
                 },
                 timeout=30,
             )
 
-        data = response.json()
+        result = response.json()
 
-        if data.get("ok"):
+        if result.get("ok"):
             return True
 
-        print("Telegram error:", data)
+        print(
+            "Telegram error:",
+            result
+        )
 
     except Exception as e:
-        print("Telegram send error:", e)
+
+        print(
+            "Telegram error:",
+            str(e)[:300]
+        )
 
     return False
 
 
 # ============================================================
-# کپشن
+# RSS
 # ============================================================
 
-def make_caption(title, summary, source, url):
-    footer = (
-        f"\n\n"
-        f"منبع: {source}\n"
-        f"🔗 {url}"
-    )
+def get_candidates():
 
-    prefix = f"📰 {title}\n\n"
-
-    available = 1024 - len(prefix) - len(footer)
-
-    if available < 100:
-        summary = summary[:100]
-    else:
-        summary = summary[:available]
-
-    return prefix + summary + footer
-
-
-# ============================================================
-# دریافت RSS
-# ============================================================
-
-def fetch_candidates():
     candidates = []
 
     for query in QUERIES:
 
-        print("Fetching:", query)
+        print(
+            "Fetching:",
+            query
+        )
 
-        rss_url = (
+        url = (
             "https://news.google.com/rss/search?"
             f"q={requests.utils.quote(query)}"
             "&hl=en-US"
@@ -636,92 +875,93 @@ def fetch_candidates():
         )
 
         try:
+
             response = session.get(
-                rss_url,
+                url,
                 timeout=20,
             )
 
             if response.status_code != 200:
-                print(
-                    "RSS error:",
-                    response.status_code
-                )
                 continue
 
-            root = BeautifulSoup(
+            soup = BeautifulSoup(
                 response.content,
-                "xml",
+                "xml"
             )
 
-            items = root.find_all("item")
+            for item in soup.find_all(
+                "item"
+            )[:20]:
 
-            for item in items[:15]:
-
-                title = clean_text(
-                    item.find("title").text
-                    if item.find("title")
+                title = clean(
+                    item.title.text
+                    if item.title
                     else ""
                 )
 
-                description = clean_text(
-                    item.find("description").text
-                    if item.find("description")
+                description = clean(
+                    item.description.text
+                    if item.description
                     else ""
                 )
 
-                link = (
-                    item.find("link").text.strip()
-                    if item.find("link")
+                link = clean(
+                    item.link.text
+                    if item.link
                     else ""
                 )
 
-                source_name = allowed_source_from_rss(
+                source = rss_source(
                     item
                 )
 
                 # فقط منابع مجاز
-                if not source_name:
+                if not source:
                     continue
 
-                # فقط موضوعات مجاز
-                if not is_relevant(
+                if not relevant(
                     title,
-                    description,
+                    description
                 ):
                     continue
-
-                score = urgency_score(
-                    title,
-                    description,
-                )
 
                 candidates.append({
                     "title": title,
                     "description": description,
                     "google_url": link,
-                    "source": source_name,
-                    "score": score,
+                    "source": source,
+                    "score": urgency(
+                        title,
+                        description
+                    ),
                 })
 
         except Exception as e:
-            print("RSS fetch error:", e)
+
+            print(
+                "RSS error:",
+                str(e)[:200]
+            )
 
         time.sleep(1)
 
-    # حذف لینک‌های تکراری
     unique = {}
+
     for item in candidates:
-        unique[item["google_url"]] = item
+        unique[
+            item["google_url"]
+        ] = item
 
-    candidates = list(unique.values())
-
-    # اول خبرهای مهم‌تر، سپس ترتیب RSS
-    candidates.sort(
-        key=lambda x: x["score"],
-        reverse=True,
+    result = list(
+        unique.values()
     )
 
-    return candidates
+    result.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    return result
 
 
 # ============================================================
@@ -732,39 +972,28 @@ def main():
 
     print("=" * 60)
     print("JAHANTAB TELEGRAM NEWS BOT")
-    print("Starting...")
+    print("NEW VERSION")
     print("=" * 60)
-
-    if not BOT_TOKEN:
-        print("BOT_TOKEN is missing.")
-        return
-
-    if not OPENAI_API_KEY:
-        print("OPENAI_API_KEY is missing.")
-        return
 
     sent = load_sent()
 
-    print("Already sent:", len(sent))
-
-    candidates = fetch_candidates()
-
     print(
-        "Candidates found:",
-        len(candidates),
+        "Already sent:",
+        len(sent)
     )
 
-    if not candidates:
-        print("No suitable news found.")
-        return
+    candidates = get_candidates()
 
-    # --------------------------------------------------------
-    # یکی یکی امتحان می‌کنیم تا اولین خبر معتبر پیدا شود
-    # --------------------------------------------------------
+    print(
+        "Candidates:",
+        len(candidates)
+    )
 
-    for candidate in candidates:
+    for item in candidates:
 
-        google_url = candidate["google_url"]
+        google_url = item[
+            "google_url"
+        ]
 
         if not google_url:
             continue
@@ -773,48 +1002,53 @@ def main():
             continue
 
         print("-" * 60)
-
         print(
-            "Selected:",
-            candidate["title"]
+            "Candidate:",
+            item["title"]
         )
-
         print(
-            "Source:",
-            candidate["source"]
+            "RSS source:",
+            item["source"]
         )
 
         # ----------------------------------------------------
-        # تبدیل Google News به لینک اصلی
+        # لینک واقعی
         # ----------------------------------------------------
 
-        direct_url = resolve_google_news(
+        direct_url = decode_google(
             google_url
         )
 
         if not direct_url:
+
             print(
-                "Skipping: direct URL unavailable."
+                "SKIP: no direct URL"
             )
             continue
 
         # ----------------------------------------------------
-        # بررسی دوباره منبع لینک اصلی
+        # منبع واقعی را از URL تشخیص بده
         # ----------------------------------------------------
 
-        direct_source = allowed_source_from_domain(
+        real_source = allowed_source(
             direct_url
         )
 
-        if not direct_source:
+        if not real_source:
+
             print(
-                "Skipping: decoded URL is not "
-                "from an allowed source."
+                "SKIP: source not allowed:",
+                domain(direct_url)
             )
             continue
 
+        print(
+            "Real source:",
+            real_source
+        )
+
         # ----------------------------------------------------
-        # دریافت اطلاعات مقاله
+        # مقاله واقعی
         # ----------------------------------------------------
 
         article = get_article(
@@ -822,55 +1056,42 @@ def main():
         )
 
         if not article:
-            print(
-                "Skipping: article unavailable."
-            )
             continue
 
-        final_url = article["url"]
+        final_url = article[
+            "url"
+        ]
 
-        print("Final URL:")
-        print(final_url)
-
-        # ----------------------------------------------------
-        # مطمئن شو لینک واقعی است
-        # ----------------------------------------------------
-
+        # دوباره چک
         if "news.google.com" in final_url:
             print(
-                "Skipping: still a Google News URL."
+                "SKIP: Google URL"
             )
             continue
-
-        # ----------------------------------------------------
-        # جلوگیری از تکرار با لینک اصلی
-        # ----------------------------------------------------
 
         if final_url in sent:
-            print(
-                "Already sent direct URL."
-            )
             continue
 
         # ----------------------------------------------------
-        # ساخت متن فارسی
+        # متن فارسی
         # ----------------------------------------------------
 
-        fa = make_persian_news(
+        fa = make_persian(
             article["title"]
-            or candidate["title"],
+            or item["title"],
 
             article["description"]
-            or candidate["description"],
+            or item["description"],
 
             article["text"],
 
-            direct_source,
+            real_source,
         )
 
         if not fa:
+
             print(
-                "Skipping: Persian text was not created."
+                "SKIP: no Persian text"
             )
             continue
 
@@ -880,76 +1101,75 @@ def main():
         )
 
         # ----------------------------------------------------
-        # تصویر
+        # تصویر واقعی
         # ----------------------------------------------------
 
-        image_file = None
+        image = None
 
-        if article.get("image"):
-            print("Downloading article image...")
+        if article["image"]:
 
-            image_file = download_image(
+            image = download_image(
                 article["image"]
             )
 
-        if not image_file:
+        if not image:
+
             print(
-                "Article image unavailable."
+                "Using fallback image."
             )
 
-            if os.path.exists(FALLBACK_FILE):
-                image_file = FALLBACK_FILE
+            if os.path.exists(
+                FALLBACK_FILE
+            ):
+                image = FALLBACK_FILE
 
-        if not image_file:
-            print(
-                "Skipping: no image available."
-            )
+        if not image:
             continue
 
         # ----------------------------------------------------
-        # اضافه کردن لوگو
+        # لوگو
         # ----------------------------------------------------
 
-        final_image = add_logo(
-            image_file
+        image = add_logo(
+            image
         )
 
-        if not final_image:
+        if not image:
             continue
-
-        # ----------------------------------------------------
-        # کپشن
-        # ----------------------------------------------------
-
-        caption = make_caption(
-            fa["title"],
-            fa["summary"],
-            direct_source,
-            final_url,
-        )
 
         # ----------------------------------------------------
         # ارسال
         # ----------------------------------------------------
 
-        print("Sending to Telegram...")
+        print(
+            "Sending..."
+        )
 
         success = send_photo(
-            final_image,
-            caption,
+            image,
+            fa["title"],
+            fa["summary"],
+            real_source,
+            final_url,
         )
 
         if success:
 
-            print("Sent successfully.")
+            print(
+                "SENT SUCCESSFULLY"
+            )
 
-            sent.add(final_url)
+            sent.add(
+                final_url
+            )
 
-            # Google URL را هم ذخیره می‌کنیم
-            # تا همان خبر دوباره انتخاب نشود
-            sent.add(google_url)
+            sent.add(
+                google_url
+            )
 
-            save_sent(sent)
+            save_sent(
+                sent
+            )
 
             print("=" * 60)
             print("DONE")
@@ -957,13 +1177,8 @@ def main():
 
             return
 
-        else:
-            print(
-                "Telegram send failed."
-            )
-
     print("=" * 60)
-    print("No news was published this run.")
+    print("NO NEWS PUBLISHED")
     print("=" * 60)
 
 
