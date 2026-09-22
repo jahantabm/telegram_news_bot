@@ -19,10 +19,10 @@ from PIL import Image
 
 # =========================================================
 # JAHANTAB TELEGRAM NEWS BOT
-# STRICT FILTER VERSION 2.0
+# STRICT FILTER VERSION 2.1
 # =========================================================
 
-VERSION = "JAHANTAB TELEGRAM NEWS BOT - STRICT FILTER V2.0"
+VERSION = "JAHANTAB TELEGRAM NEWS BOT - STRICT FILTER V2.1"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
@@ -53,7 +53,7 @@ USER_AGENT = (
     "AppleWebKit/537.36 "
     "(KHTML, like Gecko) "
     "Chrome/131.0 Safari/537.36 "
-    "JAHANTAB-News-Bot/2.0"
+    "JAHANTAB-News-Bot/2.1"
 )
 
 HEADERS = {
@@ -230,11 +230,6 @@ TRUSTED_SOURCES = {
 # =========================================================
 # DIRECT IMPORTANT TOPICS
 # =========================================================
-
-# نکته:
-# فقط وجود کلمه «ایران»، «آمریکا»، «اسرائیل»،
-# «خلیج فارس» و... به تنهایی کافی نیست.
-
 
 IRAN_DIRECT = {
     "حمله به ایران",
@@ -515,7 +510,7 @@ ANALYSIS_TERMS = {
 # TEXT FUNCTIONS
 # =========================================================
 
-def normalize_text(text: str) -> str:
+def normalize_text(text: str):
 
     if not text:
         return ""
@@ -560,7 +555,7 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
-def clean_title(title: str) -> str:
+def clean_title(title: str):
 
     title = normalize_text(title)
 
@@ -1301,7 +1296,6 @@ def local_accident_score(
 
             severity += 3
 
-    # زلزله
     magnitude = earthquake_magnitude(
         full
     )
@@ -1369,13 +1363,11 @@ def calculate_score(
         body
     )
 
-    # موضوع مستقیم + رویداد
     major = (
         direct_score >= 12
         and event_score >= 5
     )
 
-    # حادثه مهم
     local_major = (
         accident_score >= 12
     )
@@ -1391,12 +1383,10 @@ def calculate_score(
         + accident_score
     )
 
-    # اعتبار منبع
     if item.source in TRUSTED_SOURCES:
 
         score += 2
 
-    # تازگی
     age = age_hours(
         item.published
     )
@@ -1497,8 +1487,6 @@ def is_excluded(
         + body
     )
 
-    # خبر مهم واقعی نباید صرفاً
-    # به خاطر یک کلمه عمومی حذف شود.
     if item.is_major:
 
         return False
@@ -1525,7 +1513,6 @@ def evaluate(
 
         return False
 
-    # خبر قدیمی
     if (
         item.published
         and age_hours(
@@ -1557,22 +1544,18 @@ def evaluate(
         )
     )
 
-    # خبر مستقیم منطقه‌ای /
-    # بین‌المللی مرتبط با ایران
     if direct_score >= 12:
 
         return (
             item.score >= MIN_SCORE
         )
 
-    # حادثه مهم محلی
     if accident_score >= 12:
 
         return (
             item.score >= MIN_SCORE
         )
 
-    # زلزله 6 ریشتر و بالاتر
     magnitude = earthquake_magnitude(
         title + " " + body
     )
@@ -1588,7 +1571,7 @@ def evaluate(
 
 
 # =========================================================
-# DEDUPLICATION
+# DEDUPLICATION / ANTI DUPLICATE
 # =========================================================
 
 def load_lines(
@@ -1672,43 +1655,384 @@ def title_fingerprint(
     ).hexdigest()
 
 
+# ---------------------------------------------------------
+# کلمات عمومی که برای تشخیص رویداد ارزش کمی دارند
+# ---------------------------------------------------------
+
+PERSIAN_STOPWORDS = {
+    "از",
+    "به",
+    "در",
+    "با",
+    "برای",
+    "و",
+    "یا",
+    "که",
+    "را",
+    "این",
+    "آن",
+    "یک",
+    "های",
+    "ها",
+    "شد",
+    "شده",
+    "شدند",
+    "کرد",
+    "کرده",
+    "کردند",
+    "است",
+    "هست",
+    "بود",
+    "بودند",
+    "می",
+    "شود",
+    "شوند",
+    "روی",
+    "بر",
+    "تا",
+    "هم",
+    "نیز",
+    "اما",
+    "اگر",
+    "پس",
+    "هر",
+    "همه",
+    "درباره",
+    "مورد",
+}
+
+
+EVENT_GENERIC_WORDS = {
+    "خبر",
+    "گزارش",
+    "اعلام",
+    "آخرین",
+    "جدید",
+    "مهم",
+    "فوری",
+    "امروز",
+    "امشب",
+    "صبح",
+    "عصر",
+    "دقایقی",
+    "لحظاتی",
+    "جزئیات",
+    "تصاویر",
+    "واکنش",
+    "آخرین_تحولات",
+}
+
+
+def normalize_event_title(
+    title
+):
+    """
+    نرمال‌سازی ویژه برای تشخیص رویداد.
+
+    هدف این است که مثلاً:
+
+    «مجازات شناورهای متخلف در تنگه هرمز تصویب شد»
+
+    و:
+
+    «مصوبه کمیسیون امنیت ملی درباره شناورهای متخلف
+    در تنگه هرمز»
+
+    به عنوان یک رویداد تشخیص داده شوند.
+    """
+
+    text = normalize_text(
+        title
+    ).lower()
+
+    # یکسان‌سازی نیم‌فاصله
+    text = text.replace(
+        "‌",
+        ""
+    )
+
+    # حذف علائم نگارشی
+    text = re.sub(
+        r"[^\w\sآ-ی]",
+        " ",
+        text
+    )
+
+    # حذف اعداد
+    text = re.sub(
+        r"\d+",
+        " ",
+        text
+    )
+
+    words_list = text.split()
+
+    cleaned = []
+
+    for word in words_list:
+
+        if not word:
+            continue
+
+        if word in PERSIAN_STOPWORDS:
+            continue
+
+        if word in EVENT_GENERIC_WORDS:
+            continue
+
+        if len(word) < 2:
+            continue
+
+        cleaned.append(
+            word
+        )
+
+    return " ".join(
+        cleaned
+    )
+
+
+def event_words(
+    title
+):
+
+    normalized = normalize_event_title(
+        title
+    )
+
+    return set(
+        normalized.split()
+    )
+
+
+def event_similarity(
+    title_a,
+    title_b
+):
+
+    a = normalize_event_title(
+        title_a
+    )
+
+    b = normalize_event_title(
+        title_b
+    )
+
+    if not a or not b:
+
+        return 0.0
+
+    if a == b:
+
+        return 1.0
+
+    seq = SequenceMatcher(
+        None,
+        a,
+        b
+    ).ratio()
+
+    words_a = set(
+        a.split()
+    )
+
+    words_b = set(
+        b.split()
+    )
+
+    if not words_a or not words_b:
+
+        return seq
+
+    intersection = (
+        words_a & words_b
+    )
+
+    union = (
+        words_a | words_b
+    )
+
+    jaccard_score = (
+        len(intersection)
+        / len(union)
+    )
+
+    smaller = min(
+        len(words_a),
+        len(words_b)
+    )
+
+    overlap = (
+        len(intersection)
+        / smaller
+        if smaller
+        else 0.0
+    )
+
+    return max(
+        seq,
+        jaccard_score * 0.90,
+        overlap * 0.85
+    )
+
+
 def same_event(
     a: NewsItem,
     b: NewsItem
 ):
+    """
+    تشخیص اینکه دو خبر درباره یک رویداد واحد هستند یا نه.
 
-    if similarity(
-        a.title,
-        b.title
-    ) >= 0.76:
+    چند سطح بررسی:
 
-        return True
+    1. شباهت بسیار زیاد عنوان
+    2. کلمات اصلی مشترک
+    3. پوشش بالای کلمات اصلی
+    4. شباهت عنوان + خلاصه
+    """
 
-    if jaccard(
-        a.title,
-        b.title
-    ) >= 0.60:
+    title_a = getattr(
+        a,
+        "title",
+        ""
+    ) or ""
 
-        return True
+    title_b = getattr(
+        b,
+        "title",
+        ""
+    ) or ""
 
-    a_text = (
-        a.title
-        + " "
-        + a.description
+    if not title_a or not title_b:
+
+        return False
+
+    # -----------------------------------------------------
+    # 1. شباهت بسیار بالای تیتر
+    # -----------------------------------------------------
+
+    normalized_a = normalize_event_title(
+        title_a
     )
 
-    b_text = (
-        b.title
-        + " "
-        + b.description
+    normalized_b = normalize_event_title(
+        title_b
     )
 
-    if similarity(
-        a_text,
-        b_text
-    ) >= 0.73:
+    if (
+        normalized_a
+        and normalized_b
+        and normalized_a == normalized_b
+    ):
 
         return True
+
+    seq = SequenceMatcher(
+        None,
+        normalized_a,
+        normalized_b
+    ).ratio()
+
+    if seq >= 0.82:
+
+        return True
+
+    # -----------------------------------------------------
+    # 2. کلمات اصلی مشترک
+    # -----------------------------------------------------
+
+    words_a = event_words(
+        title_a
+    )
+
+    words_b = event_words(
+        title_b
+    )
+
+    if not words_a or not words_b:
+
+        return False
+
+    common = (
+        words_a & words_b
+    )
+
+    union = (
+        words_a | words_b
+    )
+
+    jaccard_score = (
+        len(common)
+        / len(union)
+    )
+
+    smaller = min(
+        len(words_a),
+        len(words_b)
+    )
+
+    overlap = (
+        len(common)
+        / smaller
+        if smaller
+        else 0.0
+    )
+
+    # حداقل 3 کلمه اصلی مشترک
+    if (
+        len(common) >= 3
+        and jaccard_score >= 0.45
+    ):
+
+        return True
+
+    # بخش بزرگی از کلمات اصلی مشترک است
+    if (
+        len(common) >= 3
+        and overlap >= 0.65
+    ):
+
+        return True
+
+    # -----------------------------------------------------
+    # 3. مقایسه عنوان + خلاصه
+    # -----------------------------------------------------
+
+    desc_a = getattr(
+        a,
+        "description",
+        ""
+    ) or ""
+
+    desc_b = getattr(
+        b,
+        "description",
+        ""
+    ) or ""
+
+    if desc_a and desc_b:
+
+        combined_a = normalize_event_title(
+            title_a
+            + " "
+            + desc_a[:500]
+        )
+
+        combined_b = normalize_event_title(
+            title_b
+            + " "
+            + desc_b[:500]
+        )
+
+        body_similarity = SequenceMatcher(
+            None,
+            combined_a,
+            combined_b
+        ).ratio()
+
+        if body_similarity >= 0.76:
+
+            return True
 
     return False
 
@@ -1716,6 +2040,13 @@ def same_event(
 def dedupe_cross_source(
     items
 ):
+
+    """
+    حذف خبرهای تکراری در همان اجرای ربات.
+
+    اگر یک رویداد از چند رسانه منتشر شده باشد،
+    خبر دارای امتیاز بالاتر و منبع معتبرتر نگه داشته می‌شود.
+    """
 
     items = sorted(
         items,
@@ -1735,6 +2066,7 @@ def dedupe_cross_source(
 
         for old in result:
 
+            # URL یکسان
             if (
                 canonical_url(
                     item.url
@@ -1745,9 +2077,15 @@ def dedupe_cross_source(
                 )
             ):
 
+                print(
+                    "DUPLICATE URL:",
+                    item.title
+                )
+
                 duplicate = True
                 break
 
+            # تیتر دقیقاً یکسان
             if (
                 title_fingerprint(
                     item.title
@@ -1758,20 +2096,42 @@ def dedupe_cross_source(
                 )
             ):
 
+                print(
+                    "DUPLICATE TITLE:",
+                    item.title
+                )
+
                 duplicate = True
                 break
 
+            # رویداد یکسان با تیتر متفاوت
             if same_event(
                 item,
                 old
             ):
+
+                print(
+                    "DUPLICATE EVENT:"
+                )
+
+                print(
+                    f"  KEEP: {old.source} | "
+                    f"{old.title}"
+                )
+
+                print(
+                    f"  SKIP: {item.source} | "
+                    f"{item.title}"
+                )
 
                 duplicate = True
                 break
 
         if not duplicate:
 
-            result.append(item)
+            result.append(
+                item
+            )
 
     return result
 
@@ -2005,6 +2365,12 @@ def build_caption(
         item.source
     )
 
+    signature = (
+        "🌐 <b>جهان تاب</b> | "
+        "<i>آخرین تحولات جهان</i>\n"
+        "🌐 @jahantab_news"
+    )
+
     lines = []
 
     # عنوان
@@ -2035,20 +2401,77 @@ def build_caption(
 
     # امضای جهان تاب
     lines.append(
-        "🌐 <b>جهان تاب</b> | "
-        "<i>آخرین تحولات جهان</i>"
+        signature
     )
 
     caption = "\n".join(
         lines
     )
 
+    # Telegram برای sendPhoto محدودیت کپشن دارد.
+    # امضا باید حتماً باقی بماند.
     if len(caption) > 1000:
 
-        caption = (
-            caption[:997]
-            + "..."
+        fixed_end = (
+            "\n\n"
+            "🔗 منبع: "
+            + source
+            + "\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            + signature
         )
+
+        available = (
+            1000
+            - len(fixed_end)
+            - len(title)
+            - 30
+        )
+
+        if available < 100:
+
+            available = 100
+
+        short_description = escape_html(
+            shorten(
+                item.description,
+                available
+            )
+        )
+
+        lines = [
+            f"📰 <b>{title}</b>",
+            "",
+        ]
+
+        if short_description:
+
+            lines.append(
+                short_description
+            )
+
+            lines.append("")
+
+        lines.append(
+            f"🔗 منبع: {source}"
+        )
+
+        lines.append(
+            "━━━━━━━━━━━━━━━━━━"
+        )
+
+        lines.append(
+            signature
+        )
+
+        caption = "\n".join(
+            lines
+        )
+
+        # محافظ نهایی
+        if len(caption) > 1000:
+
+            caption = caption[:1000]
 
     return caption
 
@@ -2369,6 +2792,68 @@ def can_publish_now(
 
 
 # =========================================================
+# PREVIOUS EVENT CHECK
+# =========================================================
+
+def is_previous_event_duplicate(
+    item: NewsItem,
+    sent_titles
+):
+    """
+    بررسی خبر فعلی در برابر تیترهای قبلاً منتشرشده.
+
+    خطوط قدیمی SHA1 هستند و نادیده گرفته می‌شوند.
+    خطوط جدید با TITLE: ذخیره می‌شوند.
+    """
+
+    for old_title in sent_titles:
+
+        if not old_title.startswith(
+            "TITLE:"
+        ):
+
+            continue
+
+        previous_title = (
+            old_title[6:].strip()
+        )
+
+        if not previous_title:
+
+            continue
+
+        previous_item = NewsItem(
+            title=previous_title,
+            url="",
+            source="",
+            domain="",
+            description=""
+        )
+
+        if same_event(
+            item,
+            previous_item
+        ):
+
+            print(
+                "SKIP: semantic duplicate "
+                "of previously published news"
+            )
+
+            print(
+                f"OLD: {previous_title}"
+            )
+
+            print(
+                f"NEW: {item.title}"
+            )
+
+            return True
+
+    return False
+
+
+# =========================================================
 # SELECT ONE NEWS
 # =========================================================
 
@@ -2392,11 +2877,31 @@ def select_items(
             )
         )
 
+        # لینک قبلاً ارسال شده
         if link in sent_links:
+
+            print(
+                f"SKIP: already sent URL: "
+                f"{item.title}"
+            )
 
             continue
 
+        # تیتر دقیقاً قبلاً ارسال شده
         if title_hash in sent_titles:
+
+            print(
+                f"SKIP: already sent title: "
+                f"{item.title}"
+            )
+
+            continue
+
+        # رویداد قبلاً از منبع دیگری ارسال شده
+        if is_previous_event_duplicate(
+            item,
+            sent_titles
+        ):
 
             continue
 
@@ -2404,6 +2909,7 @@ def select_items(
             item
         )
 
+    # حذف تکراری‌ها در همین اجرای ربات
     candidates = dedupe_cross_source(
         candidates
     )
@@ -2454,6 +2960,7 @@ def save_sent(
     item: NewsItem
 ):
 
+    # لینک اصلی
     append_line(
         SENT_LINKS_FILE,
         canonical_url(
@@ -2461,9 +2968,19 @@ def save_sent(
         )
     )
 
+    # هش تیتر برای تکرار دقیق
     append_line(
         SENT_TITLES_FILE,
         title_fingerprint(
+            item.title
+        )
+    )
+
+    # تیتر نرمال‌شده برای تشخیص
+    # تکرار معنایی در اجراهای آینده
+    append_line(
+        SENT_TITLES_FILE,
+        "TITLE:" + normalize_event_title(
             item.title
         )
     )
@@ -2624,6 +3141,12 @@ def run_once():
 
             sent_titles.add(
                 title_fingerprint(
+                    item.title
+                )
+            )
+
+            sent_titles.add(
+                "TITLE:" + normalize_event_title(
                     item.title
                 )
             )
