@@ -5,8 +5,8 @@ import re
 import json
 import time
 import hashlib
-from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from html import unescape
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -18,38 +18,39 @@ from PIL import Image
 
 
 # =========================================================
-# CONFIG
+# JAHANTAB TELEGRAM NEWS BOT - FILTERED FINAL VERSION
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-MAX_POSTS_PER_RUN = 3
-MAX_ITEMS_PER_SOURCE = 12
+# در هر اجرای GitHub فقط یک خبر
+MAX_POSTS_PER_RUN = 1
 
-# خبرهای خیلی قدیمی بررسی نشوند
+MAX_ITEMS_PER_SOURCE = 15
 MAX_AGE_HOURS = 12
 
-# حداقل امتیاز برای عبور از فیلتر
-MIN_SCORE = 15
+# حداقل امتیاز
+MIN_SCORE = 16
 
-# فاصله بین ارسال‌ها
+# فاصله بین ارسال‌های داخل یک اجرا
 POST_DELAY = 2
 
-# حداکثر تعداد خبر فوری واقعی در هر اجرا
-URGENT_SLOTS = 1
-
-# فایل‌های جلوگیری از تکرار
+# فایل‌های ضدتکرار
 SENT_LINKS_FILE = "sent_links.txt"
 SENT_TITLES_FILE = "sent_titles.txt"
+
+# ثبت آخرین ارسال برای زمان‌بندی 15 دقیقه‌ای
+LAST_PUBLISH_FILE = "last_publish.txt"
 
 REQUEST_TIMEOUT = 20
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "AppleWebKit/537.36 "
+    "(KHTML, like Gecko) "
     "Chrome/131.0 Safari/537.36 "
-    "JAHANTAB-News-Bot/1.0"
+    "JAHANTAB-News-Bot/2.0"
 )
 
 HEADERS = {
@@ -81,16 +82,14 @@ class NewsItem:
 
     description: str = ""
     image: str = ""
-
     published: datetime | None = None
 
     score: int = 0
-    matched: list[str] = field(default_factory=list)
+    event_score: int = 0
+    urgency_score: int = 0
 
-    urgency: int = 0
-    is_urgent: bool = False
-
-    topic: str = "تحولات ایران و منطقه"
+    is_major: bool = False
+    is_very_major: bool = False
 
 
 SOURCES = [
@@ -128,8 +127,6 @@ SOURCES = [
            "https://www.alef.ir/"),
     Source("ایلنا", "ilna.ir",
            "https://www.ilna.ir/"),
-
-    # NEW
     Source("روز پلاس", "roozplus.com",
            "https://www.roozplus.com/"),
 ]
@@ -147,140 +144,185 @@ TRUSTED_SOURCES = {
 
 
 # =========================================================
-# KEYWORDS
+# IMPORTANT DIRECT TOPICS
 # =========================================================
 
-IRAN_US_TERMS = {
-    "ایران": 3,
-    "آمریکا": 3,
-    "آمریکایی": 3,
-    "ترامپ": 3,
-    "واشنگتن": 2,
-    "پنتاگون": 4,
-    "سنتکام": 4,
-    "نیروهای آمریکایی": 4,
-    "پایگاه آمریکا": 5,
-    "پایگاه آمریکایی": 5,
-    "نیروهای ایران": 3,
-    "سپاه": 3,
-    "سپاه پاسداران": 4,
-    "ارتش": 2,
-    "موشک": 4,
-    "موشکی": 4,
-    "پدافند": 4,
-    "حمله آمریکا": 7,
-    "حمله ایران": 7,
-    "پاسخ ایران": 6,
-    "پاسخ موشکی": 7,
-    "درگیری ایران و آمریکا": 8,
-    "جنگ ایران و آمریکا": 8,
-    "جنگ ایران آمریکا": 8,
-    "تحریم": 2,
-    "تحریم‌های آمریکا": 3,
-    "هسته‌ای": 2,
-    "تأسیسات هسته‌ای": 5,
+# نکته مهم:
+# «ایران» یا «آمریکا» به تنهایی کافی نیستند.
+
+IRAN_DIRECT = {
+    "حمله به ایران",
+    "حمله به ایران",
+    "حمله آمریکا به ایران",
+    "حمله اسرائیل به ایران",
+    "حمله ایران به آمریکا",
+    "حمله ایران به اسرائیل",
+    "حمله موشکی به ایران",
+    "حمله هوایی به ایران",
+    "پاسخ ایران",
+    "پاسخ موشکی ایران",
+    "عملیات ایران",
+    "عملیات علیه ایران",
+    "درگیری ایران و آمریکا",
+    "درگیری ایران و اسرائیل",
+    "جنگ ایران و آمریکا",
+    "جنگ ایران و اسرائیل",
+    "نیروهای آمریکایی در ایران",
+    "پایگاه آمریکایی",
+    "پایگاه آمریکا",
+    "سنتکام",
+    "پنتاگون",
+    "نیروهای آمریکایی",
+    "تأسیسات هسته‌ای ایران",
+    "تاسیسات هسته‌ای ایران",
+    "برنامه هسته‌ای ایران",
+    "حمله به تأسیسات هسته‌ای",
+    "تحریم آمریکا علیه ایران",
 }
 
-
-HORMUZ_TERMS = {
-    "تنگه هرمز": 8,
-    "خلیج فارس": 4,
-    "دریای عمان": 3,
-    "باب‌المندب": 6,
-    "باب المندب": 6,
-    "دریای سرخ": 5,
-    "نفتکش": 4,
-    "نفت‌کش": 4,
-    "کشتی": 2,
-    "کشتیرانی": 3,
-    "آب‌های خلیج فارس": 4,
+ISRAEL_REGION_DIRECT = {
+    "حمله اسرائیل",
+    "حمله به اسرائیل",
+    "حمله ایران به اسرائیل",
+    "حمله اسرائیل به ایران",
+    "درگیری اسرائیل",
+    "جنگ اسرائیل",
+    "عملیات اسرائیل",
+    "ارتش اسرائیل",
+    "حمله اسرائیل به غزه",
+    "حمله اسرائیل به لبنان",
 }
 
-
-RESISTANCE_TERMS = {
-    "حزب‌الله": 6,
-    "حزب الله": 6,
-    "لبنان": 3,
-    "حماس": 5,
-    "فلسطین": 4,
-    "غزه": 5,
-    "اسرائیل": 5,
-    "اسرائیلی": 5,
-    "نتانیاهو": 4,
-    "انصارالله": 6,
-    "انصار الله": 6,
-    "حوثی": 6,
-    "حوثی‌ها": 6,
-    "یمن": 4,
-    "حشدالشعبی": 6,
-    "حشد الشعبی": 6,
-    "عراق": 3,
-    "محور مقاومت": 5,
-    "سوریه": 3,
+RESISTANCE_DIRECT = {
+    "حزب‌الله",
+    "حزب الله",
+    "حمله حزب‌الله",
+    "حمله حزب الله",
+    "عملیات حزب‌الله",
+    "عملیات حزب الله",
+    "حماس",
+    "حمله حماس",
+    "عملیات حماس",
+    "جنگ غزه",
+    "حمله به غزه",
+    "حمله به لبنان",
+    "انصارالله",
+    "انصار الله",
+    "حوثی‌ها",
+    "حوثی ها",
+    "حمله حوثی‌ها",
+    "حمله حوثی ها",
+    "عملیات انصارالله",
+    "عملیات انصار الله",
+    "حشدالشعبی",
+    "حشد الشعبی",
+    "عملیات حشدالشعبی",
 }
 
+MARITIME_DIRECT = {
+    "تنگه هرمز",
+    "بستن تنگه هرمز",
+    "انسداد تنگه هرمز",
+    "بازگشایی تنگه هرمز",
+    "خلیج فارس",
+    "حمله در خلیج فارس",
+    "درگیری در خلیج فارس",
+    "نفتکش",
+    "نفت‌کش",
+    "توقیف نفتکش",
+    "توقیف نفت‌کش",
+    "حمله به نفتکش",
+    "حمله به نفت‌کش",
+    "کشتیرانی در خلیج فارس",
+    "باب‌المندب",
+    "باب المندب",
+    "حمله در دریای سرخ",
+    "کشتیرانی دریای سرخ",
+}
 
 MAJOR_EVENT_TERMS = {
     "حمله": 5,
     "حمله موشکی": 8,
     "حمله هوایی": 7,
-    "عملیات": 5,
-    "عملیات نظامی": 7,
-    "انفجار": 6,
-    "شلیک": 6,
-    "موشک": 5,
-    "پاسخ": 4,
-    "پاسخ نظامی": 7,
-    "آتش‌بس": 6,
-    "آتش بس": 6,
-    "ترور": 7,
-    "کشته": 5,
-    "شهید": 5,
-    "مجروح": 4,
+    "انفجار": 7,
+    "انفجار بزرگ": 10,
+    "عملیات نظامی": 8,
+    "عملیات": 4,
+    "شلیک موشک": 8,
+    "پاسخ نظامی": 8,
+    "آتش‌بس": 7,
+    "آتش بس": 7,
+    "اعلام جنگ": 12,
+    "آغاز جنگ": 12,
+    "پایان جنگ": 10,
+    "ترور": 8,
+    "کشته": 4,
+    "کشته شدند": 6,
     "تلفات": 5,
-    "اسیر": 4,
+    "مجروح": 4,
+    "مجروح شدند": 5,
+    "رهگیری": 6,
+    "انهدام": 6,
     "سقوط": 4,
-    "رهگیری": 5,
-    "انهدام": 5,
-    "اعلام جنگ": 9,
-    "آغاز جنگ": 9,
-    "پایان جنگ": 8,
-    "قطعنامه": 3,
-    "اولتیماتوم": 5,
+    "توقیف": 6,
+    "اسارت": 6,
+    "اولتیماتوم": 6,
 }
 
 
-URGENT_TERMS = {
-    "لحظاتی پیش": 8,
-    "دقایقی پیش": 7,
-    "همین الان": 8,
-    "هم‌اکنون": 8,
-    "هم اکنون": 8,
-    "در این لحظه": 7,
-    "فوری": 3,
-    "خبر فوری": 3,
-    "تازه‌ترین": 2,
-    "تکمیلی": 2,
+# =========================================================
+# LOCAL / NATIONAL ACCIDENTS
+# =========================================================
+
+ACCIDENT_TERMS = {
+    "تصادف",
+    "سانحه رانندگی",
+    "حادثه رانندگی",
+    "واژگونی",
+    "غرق شد",
+    "غرق شدند",
+    "غرق شدن",
+    "آتش‌سوزی",
+    "آتش سوزی",
+    "انفجار",
+    "ریزش ساختمان",
+    "ریزش آوار",
+    "فروریختن ساختمان",
+    "سیل",
+    "زلزله",
+    "رانش زمین",
+    "معدن",
+    "حادثه معدن",
 }
 
-
-ANALYSIS_TERMS = {
-    "تحلیل",
-    "یادداشت",
-    "کارشناس",
-    "گفتگو",
-    "گفت‌وگو",
-    "بررسی",
-    "چرا",
-    "چگونه",
-    "روایت",
-    "تحلیلگر",
-    "سناریو",
-    "پیش‌بینی",
-    "آینده جنگ",
-    "پرونده",
+SEVERE_ACCIDENT_TERMS = {
+    "کشته",
+    "کشته شدند",
+    "جان باخت",
+    "جان باختند",
+    "فوت",
+    "تلفات",
+    "مصدوم",
+    "مصدومان",
+    "مجروح",
+    "مجروحان",
+    "نجات",
+    "عملیات امداد",
+    "مفقود",
+    "مفقودان",
 }
 
+# زلزله 6 ریشتر و بالاتر
+EARTHQUAKE_PATTERNS = [
+    r"زلزله[^.]{0,80}([6-9](?:\.\d+)?)\s*(?:ریشتر|درجه)",
+    r"([6-9](?:\.\d+)?)\s*(?:ریشتر|درجه)[^.\n]{0,30}زلزله",
+    r"زلزله[^.]{0,80}مقیاس\s*([6-9](?:\.\d+)?)",
+]
+
+
+# =========================================================
+# EXCLUDE ORDINARY NEWS
+# =========================================================
 
 EXCLUDE_TERMS = {
     "فوتبال",
@@ -293,13 +335,19 @@ EXCLUDE_TERMS = {
     "فیلم",
     "موسیقی",
     "کنسرت",
-    "سلامت",
     "پزشکی",
+    "سلامت",
     "بیمارستان",
-    "آموزش",
     "دانشگاه",
+    "دانشجو",
     "مدرسه",
+    "مدارس",
+    "آموزش",
+    "تعطیلی مدارس",
+    "مجازی شد",
+    "غیرحضوری",
     "هواشناسی",
+    "آب و هوا",
     "بورس",
     "قیمت دلار",
     "قیمت طلا",
@@ -308,19 +356,32 @@ EXCLUDE_TERMS = {
     "گردشگری",
     "تکنولوژی",
     "اینترنت",
+    "فال",
+    "آشپزی",
+    "سبک زندگی",
+    "چهره",
+    "سلبریتی",
 }
 
 
-STRONG_TOPIC_TERMS = (
-    set(IRAN_US_TERMS)
-    | set(HORMUZ_TERMS)
-    | set(RESISTANCE_TERMS)
-    | set(MAJOR_EVENT_TERMS)
-)
+ANALYSIS_TERMS = {
+    "تحلیل",
+    "یادداشت",
+    "گفتگو",
+    "گفت‌وگو",
+    "بررسی",
+    "چرا",
+    "چگونه",
+    "سناریو",
+    "پیش‌بینی",
+    "آینده جنگ",
+    "پرونده",
+    "تحلیلگر",
+}
 
 
 # =========================================================
-# TEXT HELPERS
+# TEXT
 # =========================================================
 
 def normalize_text(text: str) -> str:
@@ -338,7 +399,6 @@ def normalize_text(text: str) -> str:
         "ؤ": "و",
         "إ": "ا",
         "أ": "ا",
-        "ٱ": "ا",
         "\u200c": " ",
         "\u200f": " ",
         "\u200e": " ",
@@ -349,7 +409,6 @@ def normalize_text(text: str) -> str:
 
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"https?://\S+", " ", text)
-
     text = re.sub(r"\s+", " ", text)
 
     return text.strip()
@@ -358,7 +417,6 @@ def normalize_text(text: str) -> str:
 def clean_title(title: str) -> str:
     title = normalize_text(title)
 
-    # حذف عبارت‌های تبلیغاتی رایج
     title = re.sub(
         r"^(خبر فوری|فوری|اختصاصی|لحظه به لحظه)\s*[:：\-–—]*\s*",
         "",
@@ -370,22 +428,21 @@ def clean_title(title: str) -> str:
 
 
 def words(text: str) -> set[str]:
-    text = normalize_text(text).lower()
-
     return {
-        w for w in re.findall(r"[\w\u0600-\u06FF]+", text)
+        w for w in re.findall(
+            r"[\w\u0600-\u06FF]+",
+            normalize_text(text).lower()
+        )
         if len(w) >= 2
     }
 
 
 def similarity(a: str, b: str) -> float:
-    a = normalize_text(a)
-    b = normalize_text(b)
-
-    if not a or not b:
-        return 0.0
-
-    return SequenceMatcher(None, a, b).ratio()
+    return SequenceMatcher(
+        None,
+        normalize_text(a),
+        normalize_text(b)
+    ).ratio()
 
 
 def jaccard(a: str, b: str) -> float:
@@ -413,52 +470,43 @@ def shorten(text: str, limit: int) -> str:
 
 
 def escape_html(text: str) -> str:
-    text = str(text)
-
     return (
-        text.replace("&", "&amp;")
+        str(text)
+        .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
 
 
-def persian_digits(value: str) -> str:
-    table = str.maketrans(
-        "0123456789",
-        "۰۱۲۳۴۵۶۷۸۹"
-    )
-
-    return str(value).translate(table)
-
-
 # =========================================================
-# URL HELPERS
+# URL
 # =========================================================
 
 def canonical_url(url: str) -> str:
     if not url:
         return ""
 
-    url = url.strip()
+    try:
+        parsed = urlparse(url)
 
-    parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        netloc = parsed.netloc.lower()
 
-    scheme = parsed.scheme.lower()
-    netloc = parsed.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
 
-    if netloc.startswith("www."):
-        netloc = netloc[4:]
+        path = re.sub(r"/+", "/", parsed.path)
 
-    path = re.sub(r"/+", "/", parsed.path)
+        if path != "/" and path.endswith("/"):
+            path = path[:-1]
 
-    if path != "/" and path.endswith("/"):
-        path = path[:-1]
+        return urlunparse(
+            (scheme, netloc, path, "", "", "")
+        )
 
-    # query و fragment حذف می‌شوند
-    return urlunparse(
-        (scheme, netloc, path, "", "", "")
-    )
+    except Exception:
+        return url.strip()
 
 
 def same_domain(url: str, domain: str) -> bool:
@@ -468,7 +516,10 @@ def same_domain(url: str, domain: str) -> bool:
         if host.startswith("www."):
             host = host[4:]
 
-        return host == domain or host.endswith("." + domain)
+        return (
+            host == domain
+            or host.endswith("." + domain)
+        )
 
     except Exception:
         return False
@@ -478,7 +529,7 @@ def same_domain(url: str, domain: str) -> bool:
 # DATE
 # =========================================================
 
-def parse_datetime(value) -> datetime | None:
+def parse_datetime(value):
     if not value:
         return None
 
@@ -499,36 +550,19 @@ def parse_datetime(value) -> datetime | None:
     return None
 
 
-def age_hours(dt: datetime | None) -> float:
+def age_hours(dt) -> float:
     if not dt:
         return 999999
 
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
 
-    now = datetime.now(timezone.utc)
-
     return max(
         0,
-        (now - dt).total_seconds() / 3600
+        (
+            datetime.now(timezone.utc) - dt
+        ).total_seconds() / 3600
     )
-
-
-def format_time(dt: datetime | None) -> str:
-    if not dt:
-        return ""
-
-    try:
-        local = dt.astimezone(
-            timezone(timedelta(hours=3, minutes=30))
-        )
-
-        return persian_digits(
-            local.strftime("%H:%M")
-        )
-
-    except Exception:
-        return ""
 
 
 # =========================================================
@@ -550,12 +584,11 @@ def get_url(url: str):
 
     except Exception as exc:
         print(f"REQUEST ERROR: {url} -> {exc}")
-
         return None
 
 
 # =========================================================
-# RSS DISCOVERY
+# RSS
 # =========================================================
 
 FEED_PATHS = [
@@ -567,14 +600,14 @@ FEED_PATHS = [
 ]
 
 
-def discover_feeds(source: Source) -> list[str]:
+def discover_feeds(source: Source):
     found = []
 
-    # مسیرهای معمول
     for path in FEED_PATHS:
-        found.append(urljoin(source.url, path))
+        found.append(
+            urljoin(source.url, path)
+        )
 
-    # autodiscovery از صفحه اصلی
     response = get_url(source.url)
 
     if response:
@@ -610,7 +643,7 @@ def discover_feeds(source: Source) -> list[str]:
                         urljoin(
                             source.url,
                             link["href"]
-                        ),
+                        )
                     )
 
         except Exception:
@@ -627,14 +660,10 @@ def discover_feeds(source: Source) -> list[str]:
     return result[:8]
 
 
-# =========================================================
-# RSS PARSER
-# =========================================================
-
 def parse_feed(
     feed_url: str,
-    source: Source,
-) -> list[NewsItem]:
+    source: Source
+):
 
     response = get_url(feed_url)
 
@@ -650,7 +679,9 @@ def parse_feed(
 
     result = []
 
-    for entry in parsed.entries[:MAX_ITEMS_PER_SOURCE]:
+    for entry in parsed.entries[
+        :MAX_ITEMS_PER_SOURCE
+    ]:
 
         title = clean_title(
             entry.get("title", "")
@@ -669,14 +700,10 @@ def parse_feed(
         ):
             continue
 
-        description = (
+        description = normalize_text(
             entry.get("summary", "")
             or entry.get("description", "")
             or ""
-        )
-
-        description = normalize_text(
-            description
         )
 
         published = (
@@ -690,33 +717,30 @@ def parse_feed(
 
         image = ""
 
-        media_content = entry.get(
+        for media in entry.get(
             "media_content",
             []
-        )
+        ):
+            candidate = (
+                media.get("url")
+                or media.get("href")
+            )
 
-        if media_content:
-            for media in media_content:
-                candidate = (
-                    media.get("url")
-                    or media.get("href")
+            if candidate:
+                image = urljoin(
+                    url,
+                    candidate
                 )
-
-                if candidate:
-                    image = urljoin(
-                        url,
-                        candidate
-                    )
-                    break
+                break
 
         if not image:
-            media_thumbnail = entry.get(
+            thumbs = entry.get(
                 "media_thumbnail",
                 []
             )
 
-            if media_thumbnail:
-                image = media_thumbnail[0].get(
+            if thumbs:
+                image = thumbs[0].get(
                     "url",
                     ""
                 )
@@ -737,12 +761,10 @@ def parse_feed(
 
 
 # =========================================================
-# ARTICLE ENRICHMENT
+# ARTICLE
 # =========================================================
 
-def extract_article_data(
-    item: NewsItem
-) -> NewsItem:
+def extract_article_data(item: NewsItem):
 
     response = get_url(item.url)
 
@@ -754,10 +776,6 @@ def extract_article_data(
             response.text,
             "html.parser"
         )
-
-        # -------------------------------------------------
-        # IMAGE
-        # -------------------------------------------------
 
         if not item.image:
 
@@ -772,23 +790,20 @@ def extract_article_data(
                     meta["content"]
                 )
 
-            if not item.image:
-                meta = soup.find(
-                    "meta",
-                    attrs={
-                        "name": "twitter:image"
-                    }
+        if not item.image:
+
+            meta = soup.find(
+                "meta",
+                attrs={
+                    "name": "twitter:image"
+                }
+            )
+
+            if meta and meta.get("content"):
+                item.image = urljoin(
+                    item.url,
+                    meta["content"]
                 )
-
-                if meta and meta.get("content"):
-                    item.image = urljoin(
-                        item.url,
-                        meta["content"]
-                    )
-
-        # -------------------------------------------------
-        # DESCRIPTION
-        # -------------------------------------------------
 
         if not item.description:
 
@@ -804,10 +819,6 @@ def extract_article_data(
                     meta["content"]
                 )
 
-        # -------------------------------------------------
-        # PUBLISHED TIME
-        # -------------------------------------------------
-
         if not item.published:
 
             meta = soup.find(
@@ -816,10 +827,9 @@ def extract_article_data(
             )
 
             if meta and meta.get("content"):
-                raw = meta["content"]
 
                 try:
-                    value = raw.replace(
+                    value = meta["content"].replace(
                         "Z",
                         "+00:00"
                     )
@@ -840,8 +850,7 @@ def extract_article_data(
 
     except Exception as exc:
         print(
-            f"ARTICLE PARSE ERROR: "
-            f"{item.url} -> {exc}"
+            f"ARTICLE ERROR: {item.url} -> {exc}"
         )
 
     return item
@@ -851,173 +860,234 @@ def extract_article_data(
 # TOPIC DETECTION
 # =========================================================
 
-def detect_topic(
-    text: str
-) -> str:
-
-    text = normalize_text(text)
-
-    iran_us_score = sum(
-        weight
-        for term, weight in IRAN_US_TERMS.items()
-        if term in text
+def contains_any(text, terms):
+    return any(
+        term in text
+        for term in terms
     )
 
-    hormuz_score = sum(
-        weight
-        for term, weight in HORMUZ_TERMS.items()
-        if term in text
-    )
 
-    resistance_score = sum(
-        weight
-        for term, weight in RESISTANCE_TERMS.items()
-        if term in text
-    )
+def direct_topic_score(
+    title: str,
+    description: str
+):
+    """
+    عنوان وزن بسیار بیشتری دارد.
+    صرفاً وجود نام کشور/استان کافی نیست.
+    """
 
-    if hormuz_score >= max(
-        iran_us_score,
-        resistance_score,
-        6
-    ):
-        return "تنگه هرمز و تحولات منطقه"
+    title = normalize_text(title)
+    body = normalize_text(description)
 
-    if iran_us_score >= max(
-        resistance_score,
-        8
-    ):
-        return "ایران و آمریکا"
+    score = 0
+    matched = []
 
-    if resistance_score >= 7:
-        return "تحولات منطقه"
+    groups = [
+        IRAN_DIRECT,
+        ISRAEL_REGION_DIRECT,
+        RESISTANCE_DIRECT,
+        MARITIME_DIRECT,
+    ]
 
-    return "تحولات ایران و منطقه"
+    for group in groups:
+        for term in group:
+            if term in title:
+                score += 12
+                matched.append(term)
+
+            elif term in body:
+                score += 5
+                matched.append(term)
+
+    return score, matched
 
 
 # =========================================================
-# SCORING
+# EARTHQUAKE
+# =========================================================
+
+def earthquake_magnitude(text):
+    text = normalize_text(text)
+
+    for pattern in EARTHQUAKE_PATTERNS:
+
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+            try:
+                return float(
+                    match.group(1)
+                )
+            except Exception:
+                pass
+
+    return None
+
+
+# =========================================================
+# LOCAL ACCIDENT SCORE
+# =========================================================
+
+def local_accident_score(
+    title: str,
+    description: str
+):
+    title = normalize_text(title)
+    body = normalize_text(description)
+
+    full = title + " " + body
+
+    accident = contains_any(
+        full,
+        ACCIDENT_TERMS
+    )
+
+    if not accident:
+        return 0
+
+    severity = 0
+
+    for term in SEVERE_ACCIDENT_TERMS:
+        if term in title:
+            severity += 8
+        elif term in body:
+            severity += 3
+
+    # زلزله
+    magnitude = earthquake_magnitude(full)
+
+    if magnitude is not None:
+
+        if magnitude >= 6:
+            return 40
+
+        if magnitude >= 5.5:
+            return 15
+
+    return severity
+
+
+# =========================================================
+# FILTER / SCORE
 # =========================================================
 
 def calculate_score(
     item: NewsItem
 ):
 
-    text = normalize_text(
-        item.title + " " + item.description
-    )
-
-    score = 0
-    urgency = 0
-    matched = []
-
-    # ایران / آمریکا
-    for term, weight in IRAN_US_TERMS.items():
-        if term in text:
-            score += weight
-            matched.append(term)
-
-    # هرمز
-    for term, weight in HORMUZ_TERMS.items():
-        if term in text:
-            score += weight
-            matched.append(term)
-
-    # منطقه
-    for term, weight in RESISTANCE_TERMS.items():
-        if term in text:
-            score += weight
-            matched.append(term)
-
-    # رویدادهای مهم
-    for term, weight in MAJOR_EVENT_TERMS.items():
-        if term in text:
-            score += weight
-            matched.append(term)
-
-    # فوریت
-    for term, weight in URGENT_TERMS.items():
-        if term in text:
-            urgency += weight
-
-    # منبع هرگز نباید فوریت ایجاد کند
-    # بنابراین source در text وارد محاسبه نشده است.
-
-    # منبع معتبر کمی امتیاز اضافه می‌گیرد
-    if item.source in TRUSTED_SOURCES:
-        score += 2
-
-    # تازگی
-    age = age_hours(item.published)
-
-    if age <= 1:
-        score += 5
-
-    elif age <= 3:
-        score += 3
-
-    elif age <= 6:
-        score += 1
-
-    # -----------------------------------------------
-    # خبر فوری واقعی
-    # -----------------------------------------------
-
-    strong_event = any(
-        term in text
-        for term in (
-            "حمله",
-            "انفجار",
-            "شلیک",
-            "حمله موشکی",
-            "عملیات نظامی",
-            "پاسخ نظامی",
-            "ترور",
-            "آتش‌بس",
-            "اعلام جنگ",
-            "آغاز جنگ",
-            "کشته",
-            "شهید",
-            "رهگیری",
-            "انهدام",
-        )
-    )
-
-    very_recent = age <= 3
-
-    item.is_urgent = (
-        very_recent
-        and strong_event
-        and (
-            score >= 22
-            or urgency >= 8
-        )
-    )
-
-    item.score = score
-    item.urgency = urgency
-    item.matched = list(
-        dict.fromkeys(matched)
-    )
-
-    item.topic = detect_topic(text)
-
-    return item
-
-
-# =========================================================
-# FILTER
-# =========================================================
-
-def is_analysis(item: NewsItem) -> bool:
-
     title = normalize_text(
         item.title
     )
 
-    # اگر واقعاً یک رویداد فوری/مهم باشد،
-    # صرف وجود کلمه تحلیل باعث حذف آن نشود.
-    if item.is_urgent:
-        return False
+    body = normalize_text(
+        item.description
+    )
+
+    full = title + " " + body
+
+    direct_score, matched = direct_topic_score(
+        title,
+        body
+    )
+
+    event_score = 0
+
+    for term, weight in MAJOR_EVENT_TERMS.items():
+
+        if term in title:
+            event_score += weight * 2
+
+        elif term in body:
+            event_score += weight
+
+    accident_score = local_accident_score(
+        title,
+        body
+    )
+
+    # خبر بسیار مهم
+    major = (
+        direct_score >= 12
+        and event_score >= 5
+    )
+
+    # حادثه مهم محلی
+    local_major = (
+        accident_score >= 12
+    )
+
+    item.is_major = (
+        major
+        or local_major
+    )
+
+    # امتیاز نهایی
+    score = (
+        direct_score
+        + event_score
+        + accident_score
+    )
+
+    # منبع معتبر فقط کمی کمک می‌کند
+    if item.source in TRUSTED_SOURCES:
+        score += 2
+
+    # تازگی
+    age = age_hours(
+        item.published
+    )
+
+    if age <= 1:
+        score += 6
+    elif age <= 3:
+        score += 4
+    elif age <= 6:
+        score += 2
+
+    item.score = score
+    item.event_score = event_score
+
+    # -----------------------------------------
+    # حادثه فوق مهم
+    # -----------------------------------------
+
+    very_major = False
+
+    magnitude = earthquake_magnitude(full)
+
+    if magnitude is not None and magnitude >= 6:
+        very_major = True
+
+    if accident_score >= 30:
+        very_major = True
+
+    if (
+        direct_score >= 20
+        and event_score >= 12
+        and age <= 3
+    ):
+        very_major = True
+
+    item.is_very_major = very_major
+
+    item.urgency_score = (
+        event_score
+        + direct_score
+        + accident_score
+    )
+
+    return item
+
+
+def is_analysis(item: NewsItem):
+
+    title = normalize_text(
+        item.title
+    )
 
     return any(
         term in title
@@ -1025,61 +1095,97 @@ def is_analysis(item: NewsItem) -> bool:
     )
 
 
-def is_excluded(item: NewsItem) -> bool:
+def is_excluded(item: NewsItem):
 
-    text = normalize_text(
-        item.title + " " + item.description
+    title = normalize_text(
+        item.title
     )
 
-    has_strong_topic = any(
-        term in text
-        for term in STRONG_TOPIC_TERMS
+    body = normalize_text(
+        item.description
     )
 
-    if has_strong_topic:
+    full = title + " " + body
+
+    # اگر خبر یک رویداد واقعاً مهم است،
+    # کلمات عمومی حذف‌کننده نباید آن را حذف کنند.
+    if item.is_major:
         return False
 
     return any(
-        term in text
+        term in full
         for term in EXCLUDE_TERMS
     )
 
 
-def evaluate(item: NewsItem) -> bool:
-
-    text = normalize_text(
-        item.title + " " + item.description
-    )
+def evaluate(item: NewsItem):
 
     if not item.title:
-        return False
-
-    if is_excluded(item):
         return False
 
     if is_analysis(item):
         return False
 
-    age = age_hours(item.published)
-
-    # اگر تاریخ داریم، قدیمی‌ها حذف شوند
-    if item.published and age > MAX_AGE_HOURS:
+    if is_excluded(item):
         return False
 
-    # خبر خیلی فوری می‌تواند امتیاز پایین‌تری داشته باشد
-    if item.is_urgent:
-        return (
-            item.score >= MIN_SCORE - 5
-        )
+    # خبرهای قدیمی
+    if (
+        item.published
+        and age_hours(item.published)
+        > MAX_AGE_HOURS
+    ):
+        return False
 
-    return item.score >= MIN_SCORE
+    # -----------------------------------------
+    # قانون بسیار مهم:
+    # باید یا موضوع مستقیم داشته باشیم
+    # یا حادثه محلی مهم.
+    # -----------------------------------------
+
+    title = normalize_text(
+        item.title
+    )
+
+    body = normalize_text(
+        item.description
+    )
+
+    direct_score, _ = direct_topic_score(
+        title,
+        body
+    )
+
+    accident_score = local_accident_score(
+        title,
+        body
+    )
+
+    # خبر مستقیم منطقه‌ای/بین‌المللی
+    if direct_score >= 12:
+        return item.score >= MIN_SCORE
+
+    # حادثه مهم در هر استان
+    if accident_score >= 12:
+        return item.score >= MIN_SCORE
+
+    # زلزله 6+
+    magnitude = earthquake_magnitude(
+        title + " " + body
+    )
+
+    if magnitude is not None:
+        if magnitude >= 6:
+            return True
+
+    return False
 
 
 # =========================================================
-# DEDUP FILES
+# DEDUP
 # =========================================================
 
-def load_lines(filename: str) -> set[str]:
+def load_lines(filename):
 
     if not os.path.exists(filename):
         return set()
@@ -1102,8 +1208,8 @@ def load_lines(filename: str) -> set[str]:
 
 
 def append_line(
-    filename: str,
-    value: str
+    filename,
+    value
 ):
 
     try:
@@ -1119,16 +1225,11 @@ def append_line(
 
     except Exception as exc:
         print(
-            f"FILE WRITE ERROR: "
-            f"{filename} -> {exc}"
+            f"FILE WRITE ERROR: {exc}"
         )
 
 
-# =========================================================
-# TITLE FINGERPRINT
-# =========================================================
-
-def title_fingerprint(title: str) -> str:
+def title_fingerprint(title):
 
     normalized = normalize_text(
         title
@@ -1151,113 +1252,47 @@ def title_fingerprint(title: str) -> str:
     ).hexdigest()
 
 
-# =========================================================
-# SAME EVENT
-# =========================================================
-
-def important_words(text: str) -> set[str]:
-
-    text = normalize_text(text)
-
-    result = set()
-
-    important_groups = [
-        IRAN_US_TERMS,
-        HORMUZ_TERMS,
-        RESISTANCE_TERMS,
-        MAJOR_EVENT_TERMS,
-    ]
-
-    for group in important_groups:
-
-        for term in group:
-
-            if term in text:
-                result.update(
-                    words(term)
-                )
-
-    return result
-
-
 def same_event(
     a: NewsItem,
     b: NewsItem
-) -> bool:
+):
 
-    # عنوان
-    title_sim = similarity(
+    if similarity(
         a.title,
         b.title
-    )
-
-    if title_sim >= 0.78:
+    ) >= 0.76:
         return True
 
-    # کلمات عنوان
-    title_jac = jaccard(
+    if jaccard(
         a.title,
         b.title
-    )
-
-    if title_jac >= 0.65:
+    ) >= 0.60:
         return True
 
-    # محتوا
-    content_a = (
+    a_text = (
         a.title + " " + a.description
     )
 
-    content_b = (
+    b_text = (
         b.title + " " + b.description
     )
 
-    content_sim = similarity(
-        content_a,
-        content_b
-    )
-
-    if content_sim >= 0.76:
+    if similarity(
+        a_text,
+        b_text
+    ) >= 0.73:
         return True
-
-    # کلمات مهم
-    ia = important_words(
-        content_a
-    )
-
-    ib = important_words(
-        content_b
-    )
-
-    if ia and ib:
-
-        overlap = len(
-            ia & ib
-        ) / len(
-            ia | ib
-        )
-
-        if overlap >= 0.60:
-            return True
 
     return False
 
 
-# =========================================================
-# CROSS SOURCE DEDUP
-# =========================================================
+def dedupe_cross_source(items):
 
-def dedupe_cross_source(
-    items: list[NewsItem]
-) -> list[NewsItem]:
-
-    # اول خبرهای مهم‌تر
     items = sorted(
         items,
         key=lambda x: (
-            x.is_urgent,
+            x.is_very_major,
             x.score,
-            -age_hours(x.published),
             x.source in TRUSTED_SOURCES,
         ),
         reverse=True,
@@ -1269,26 +1304,25 @@ def dedupe_cross_source(
 
         duplicate = False
 
-        for existing in result:
+        for old in result:
 
             if (
                 canonical_url(item.url)
-                == canonical_url(existing.url)
+                == canonical_url(old.url)
             ):
                 duplicate = True
                 break
 
-            if title_fingerprint(
-                item.title
-            ) == title_fingerprint(
-                existing.title
+            if (
+                title_fingerprint(item.title)
+                == title_fingerprint(old.title)
             ):
                 duplicate = True
                 break
 
             if same_event(
                 item,
-                existing
+                old
             ):
                 duplicate = True
                 break
@@ -1303,17 +1337,14 @@ def dedupe_cross_source(
 # IMAGE
 # =========================================================
 
-def find_logo_file() -> str:
+def find_logo_file():
 
-    candidates = [
+    for filename in [
         "jahantab_logo_transparent-1.png",
         "logo.png",
         "logo.jpg",
         "logo.jpeg",
-    ]
-
-    for filename in candidates:
-
+    ]:
         if os.path.exists(filename):
             return filename
 
@@ -1324,9 +1355,9 @@ LOGO_FILE = find_logo_file()
 
 
 def download_image(
-    url: str,
-    filename: str = "_news_image.jpg"
-) -> str:
+    url,
+    filename="_news_image.jpg"
+):
 
     if not url:
         return ""
@@ -1351,7 +1382,12 @@ def download_image(
         if (
             "image" not in content_type
             and not url.lower().endswith(
-                (".jpg", ".jpeg", ".png", ".webp")
+                (
+                    ".jpg",
+                    ".jpeg",
+                    ".png",
+                    ".webp",
+                )
             )
         ):
             return ""
@@ -1364,12 +1400,13 @@ def download_image(
             for chunk in response.iter_content(
                 chunk_size=8192
             ):
-
                 if chunk:
                     f.write(chunk)
 
-        # بررسی معتبر بودن تصویر
-        image = Image.open(filename)
+        image = Image.open(
+            filename
+        )
+
         image.verify()
 
         return filename
@@ -1377,7 +1414,7 @@ def download_image(
     except Exception as exc:
 
         print(
-            f"IMAGE ERROR: {url} -> {exc}"
+            f"IMAGE ERROR: {exc}"
         )
 
         try:
@@ -1389,9 +1426,7 @@ def download_image(
         return ""
 
 
-def add_logo(
-    image_path: str
-) -> str:
+def add_logo(image_path):
 
     if not LOGO_FILE:
         return image_path
@@ -1406,7 +1441,6 @@ def add_logo(
             LOGO_FILE
         ).convert("RGBA")
 
-        # اندازه لوگو
         max_width = max(
             80,
             base.width // 6
@@ -1473,38 +1507,25 @@ def add_logo(
 # CAPTION
 # =========================================================
 
-def build_caption(
-    item: NewsItem
-) -> str:
+def build_caption(item):
 
-    title = shorten(
-        item.title,
-        220
+    title = escape_html(
+        shorten(item.title, 220)
     )
 
-    description = shorten(
-        item.description,
-        500
-    )
-
-    title = escape_html(title)
     description = escape_html(
-        description
+        shorten(item.description, 550)
     )
 
     source = escape_html(
         item.source
     )
 
-    time_text = format_time(
-        item.published
-    )
-
     lines = []
 
     # عنوان
     lines.append(
-        f"🇮🇷 <b>{title}</b>"
+        f"📰 <b>{title}</b>"
     )
 
     lines.append("")
@@ -1515,35 +1536,33 @@ def build_caption(
             description
         )
 
-        lines.append("")
-
-    # اطلاعات خبر
-    lines.append(
-        f"✍🏼 <b>منبع خبر:</b> {source}"
-    )
-
-    if time_text:
-        lines.append(
-            f"🕐 <b>ساعت:</b> {time_text}"
-        )
-
     lines.append("")
 
+    # منبع
+    lines.append(
+        f"🔗 منبع: {source}"
+    )
+
+    # تنها خط جداکننده‌ای که خواستیم
     lines.append(
         "━━━━━━━━━━━━━━━━━━"
     )
 
-    # امضای نهایی
+    # امضای جهان تاب
     lines.append(
         "🌐 <b>جهان تاب</b> | "
         "<i>آخرین تحولات جهان</i>"
     )
 
-    caption = "\n".join(lines)
+    caption = "\n".join(
+        lines
+    )
 
-    # محدودیت امن کپشن تلگرام
     if len(caption) > 1000:
-        caption = caption[:997] + "..."
+        caption = (
+            caption[:997]
+            + "..."
+        )
 
     return caption
 
@@ -1552,31 +1571,24 @@ def build_caption(
 # TELEGRAM
 # =========================================================
 
-def telegram_api(
-    method: str
-) -> str:
+def telegram_api(method):
 
     return (
-        f"https://api.telegram.org/bot"
+        "https://api.telegram.org/bot"
         f"{BOT_TOKEN}/{method}"
     )
 
 
 def send_photo(
-    item: NewsItem,
-    image_path: str
-) -> bool:
+    item,
+    image_path
+):
 
     if not BOT_TOKEN or not CHAT_ID:
         print(
-            "ERROR: BOT_TOKEN or CHAT_ID is missing."
+            "ERROR: BOT_TOKEN or CHAT_ID missing."
         )
-
         return False
-
-    caption = build_caption(
-        item
-    )
 
     keyboard = {
         "inline_keyboard": [
@@ -1591,7 +1603,7 @@ def send_photo(
 
     data = {
         "chat_id": CHAT_ID,
-        "caption": caption,
+        "caption": build_caption(item),
         "parse_mode": "HTML",
         "reply_markup": json.dumps(
             keyboard,
@@ -1623,7 +1635,6 @@ def send_photo(
                 print(
                     f"SENT: {item.title}"
                 )
-
                 return True
 
         print(
@@ -1632,22 +1643,20 @@ def send_photo(
             response.text[:1000]
         )
 
-        return False
-
     except Exception as exc:
 
         print(
             f"TELEGRAM SEND ERROR: {exc}"
         )
 
-        return False
+    return False
 
 
 # =========================================================
 # COLLECT
 # =========================================================
 
-def collect_items() -> list[NewsItem]:
+def collect_items():
 
     all_items = []
 
@@ -1672,7 +1681,7 @@ def collect_items() -> list[NewsItem]:
         for feed_url in feeds:
 
             print(
-                f"Checking feed: {feed_url}"
+                f"Checking: {feed_url}"
             )
 
             parsed = parse_feed(
@@ -1689,9 +1698,9 @@ def collect_items() -> list[NewsItem]:
             ):
                 break
 
-        # حذف تکرار داخلی هر منبع
+        # حذف URL تکراری
+        unique = []
         seen = set()
-        unique_source_items = []
 
         for item in source_items:
 
@@ -1703,30 +1712,14 @@ def collect_items() -> list[NewsItem]:
                 continue
 
             seen.add(key)
+            unique.append(item)
 
-            unique_source_items.append(
-                item
-            )
-
-        # اول امتیازدهی اولیه
-        for item in unique_source_items:
-
+        # ابتدا ارزیابی اولیه
+        for item in unique:
             calculate_score(item)
 
-        # فقط موارد امیدوارکننده را enrich کنیم
-        candidates = []
-
-        for item in unique_source_items:
-
-            if (
-                item.score >= MIN_SCORE - 5
-                or not item.description
-                or not item.image
-                or not item.published
-            ):
-                candidates.append(item)
-
-        for item in candidates[:10]:
+        # فقط کاندیداهای منطقی را باز کنیم
+        for item in unique[:10]:
 
             extract_article_data(
                 item
@@ -1736,17 +1729,96 @@ def collect_items() -> list[NewsItem]:
                 item
             )
 
-        for item in unique_source_items:
+        accepted = 0
+
+        for item in unique:
 
             if evaluate(item):
+
                 all_items.append(item)
+                accepted += 1
+
+            else:
+
+                print(
+                    f"FILTERED: {item.title}"
+                )
 
         print(
             f"Accepted from {source.name}: "
-            f"{sum(1 for x in unique_source_items if evaluate(x))}"
+            f"{accepted}"
         )
 
     return all_items
+
+
+# =========================================================
+# LAST PUBLISH
+# =========================================================
+
+def load_last_publish():
+
+    if not os.path.exists(
+        LAST_PUBLISH_FILE
+    ):
+        return None
+
+    try:
+
+        with open(
+            LAST_PUBLISH_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            value = f.read().strip()
+
+        return float(value)
+
+    except Exception:
+        return None
+
+
+def save_last_publish():
+
+    try:
+
+        with open(
+            LAST_PUBLISH_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            f.write(
+                str(time.time())
+            )
+
+    except Exception as exc:
+
+        print(
+            f"LAST PUBLISH ERROR: {exc}"
+        )
+
+
+def can_publish_now(has_very_major=False):
+
+    last = load_last_publish()
+
+    if last is None:
+        return True
+
+    elapsed = (
+        time.time() - last
+    ) / 60
+
+    # حادثه بسیار مهم:
+    # حداقل 10 دقیقه فاصله
+    if has_very_major:
+        return elapsed >= 10
+
+    # حالت عادی:
+    # حداقل 15 دقیقه فاصله
+    return elapsed >= 15
 
 
 # =========================================================
@@ -1754,10 +1826,10 @@ def collect_items() -> list[NewsItem]:
 # =========================================================
 
 def select_items(
-    items: list[NewsItem],
-    sent_links: set[str],
-    sent_titles: set[str],
-) -> list[NewsItem]:
+    items,
+    sent_links,
+    sent_titles
+):
 
     candidates = []
 
@@ -1772,88 +1844,69 @@ def select_items(
         )
 
         if link in sent_links:
-            print(
-                f"SKIP already sent URL: "
-                f"{item.title}"
-            )
             continue
 
         if title_hash in sent_titles:
-            print(
-                f"SKIP already sent title: "
-                f"{item.title}"
-            )
             continue
 
         candidates.append(item)
 
-    # جلوگیری از تکرار بین منابع
     candidates = dedupe_cross_source(
         candidates
     )
 
-    # مرتب‌سازی
     candidates.sort(
         key=lambda x: (
-            x.is_urgent,
+            x.is_very_major,
             x.score,
-            x.urgency,
-            -age_hours(x.published),
+            x.event_score,
             x.source in TRUSTED_SOURCES,
         ),
         reverse=True,
     )
 
-    # حداکثر یک خبر فوری واقعی
-    result = []
-    urgent_count = 0
+    if not candidates:
+        return []
 
-    for item in candidates:
+    # اول بررسی کنیم آیا حادثه فوق مهم داریم
+    very_major_exists = any(
+        x.is_very_major
+        for x in candidates
+    )
 
-        if item.is_urgent:
+    if not can_publish_now(
+        very_major_exists
+    ):
+        print(
+            "WAIT: publish interval has not arrived."
+        )
+        return []
 
-            if urgent_count >= URGENT_SLOTS:
-                continue
-
-            urgent_count += 1
-
-        result.append(item)
-
-        if len(result) >= MAX_POSTS_PER_RUN:
-            break
-
-    return result
+    # فقط یک خبر
+    return [
+        candidates[0]
+    ]
 
 
 # =========================================================
-# SAVE STATE
+# SAVE
 # =========================================================
 
-def save_sent(
-    item: NewsItem
-):
-
-    link = canonical_url(
-        item.url
-    )
-
-    title_hash = title_fingerprint(
-        item.title
-    )
+def save_sent(item):
 
     append_line(
         SENT_LINKS_FILE,
-        link
+        canonical_url(item.url)
     )
 
     append_line(
         SENT_TITLES_FILE,
-        title_hash
+        title_fingerprint(item.title)
     )
 
 
 # =========================================================
-# RUN ONCE
+# RUN
 # =========================================================
 
 def run_once():
@@ -1865,7 +1918,7 @@ def run_once():
         "JAHANTAB TELEGRAM NEWS BOT"
     )
     print(
-        "NEW FINAL VERSION"
+        "FILTERED FINAL VERSION 2.0"
     )
     print(
         "=========================================="
@@ -1873,13 +1926,13 @@ def run_once():
 
     if not BOT_TOKEN:
         print(
-            "ERROR: BOT_TOKEN is missing."
+            "ERROR: BOT_TOKEN missing."
         )
         return
 
     if not CHAT_ID:
         print(
-            "ERROR: CHAT_ID is missing."
+            "ERROR: CHAT_ID missing."
         )
         return
 
@@ -1902,13 +1955,13 @@ def run_once():
     )
 
     print(
-        "Collecting news..."
+        "Collecting and filtering news..."
     )
 
     items = collect_items()
 
     print(
-        f"Collected accepted news: "
+        f"Accepted candidates: "
         f"{len(items)}"
     )
 
@@ -1919,7 +1972,7 @@ def run_once():
     )
 
     print(
-        f"Selected for publishing: "
+        f"Selected: "
         f"{len(selected)}"
     )
 
@@ -1934,7 +1987,7 @@ def run_once():
     for item in selected:
 
         print(
-            "\n------------------------------------------"
+            "------------------------------------------"
         )
 
         print(
@@ -1950,14 +2003,11 @@ def run_once():
         )
 
         print(
-            f"Urgent: {item.is_urgent}"
+            f"VERY MAJOR: {item.is_very_major}"
         )
 
-        # اگر عکس RSS نداریم، از صفحه خبر بگیریم
         if not item.image:
-            extract_article_data(
-                item
-            )
+            extract_article_data(item)
 
         image_path = download_image(
             item.image
@@ -1966,28 +2016,25 @@ def run_once():
         if not image_path:
 
             print(
-                "No valid article image."
+                "No valid image. "
+                "News will not be published."
             )
 
             continue
 
-        # افزودن لوگو در صورت وجود
         final_image = add_logo(
             image_path
         )
 
-        sent = send_photo(
+        if send_photo(
             item,
             final_image
-        )
+        ):
 
-        if sent:
+            save_sent(item)
 
-            save_sent(
-                item
-            )
+            save_last_publish()
 
-            # برای جلوگیری از ارسال دوباره
             sent_links.add(
                 canonical_url(item.url)
             )
@@ -2000,7 +2047,6 @@ def run_once():
                 POST_DELAY
             )
 
-        # پاک‌سازی تصاویر موقت
         for filename in (
             "_news_image.jpg",
             "_final_news_image.jpg",
@@ -2015,13 +2061,11 @@ def run_once():
                 pass
 
     print(
-        "\n=========================================="
+        "=========================================="
     )
-
     print(
         "RUN FINISHED"
     )
-
     print(
         "=========================================="
     )
@@ -2029,13 +2073,9 @@ def run_once():
 
 # =========================================================
 # MAIN
-# IMPORTANT:
-# GitHub Actions runs this file every 5 minutes.
-# DO NOT use while True here.
 # =========================================================
 
 def main():
-
     run_once()
 
 
