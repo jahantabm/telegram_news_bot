@@ -2,25 +2,34 @@
 
 """
 JAHANTAB Telegram News Bot
+نسخه نهایی
+
+🌐 جهان‌تاب | آخرین تحولات جهان
 
 ویژگی‌ها:
-- منابع فارسی
 - RSS + HTML fallback
-- فیلتر سخت‌گیرانه اخبار جنگ ایران و منطقه
+- منابع متعدد فارسی
+- فیلتر اخبار مرتبط با ایران و منطقه
 - حذف اخبار قدیمی
 - حذف اخبار تحلیلی
-- حذف خبرهای تکراری با لینک
-- حذف خبرهای تکراری با عنوان
-- حذف خبرهای مشابه بین منابع مختلف
+- حذف اخبار نامرتبط
+- حذف تکراری بر اساس URL
+- حذف تکراری بر اساس عنوان
+- جلوگیری از انتشار یک رویداد از چند منبع
+- تشخیص شباهت تیترهای متفاوت
+- اولویت دادن به خبر جدیدتر و امتیاز بالاتر
 - ذخیره دائمی خبرهای ارسال‌شده
-- افزودن لوگو روی عکس
-- ارسال عکس + کپشن به Telegram
+- دریافت تصویر خبر
+- افزودن لوگو روی تصویر
+- کپشن حرفه‌ای
+- دکمه شیشه‌ای «مشاهده خبر»
 """
 
 import os
 import re
 import time
 import html
+import json
 import logging
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -75,6 +84,10 @@ HTTP_TIMEOUT = int(
     os.getenv("HTTP_TIMEOUT", "20")
 )
 
+POST_DELAY = float(
+    os.getenv("POST_DELAY", "2")
+)
+
 BASE_DIR = os.path.dirname(
     os.path.abspath(__file__)
 )
@@ -87,7 +100,6 @@ SENT_FILE = os.path.join(
     )
 )
 
-# فایل دوم برای جلوگیری از تکرار عنوان
 SENT_TITLES_FILE = os.path.join(
     BASE_DIR,
     os.getenv(
@@ -111,9 +123,10 @@ LOGO_FILE = os.path.join(
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "AppleWebKit/537.36 "
+    "(KHTML, like Gecko) "
     "Chrome/128.0 Safari/537.36 "
-    "JAHANTAB-NewsBot/3.0"
+    "JAHANTAB-NewsBot/5.0"
 )
 
 HEADERS = {
@@ -331,7 +344,6 @@ CORE_ENTITIES = {
     "باب‌المندب": 5,
 }
 
-
 MILITARY_ACTIONS = {
     "حمله": 7,
     "حملات": 7,
@@ -372,7 +384,6 @@ MILITARY_ACTIONS = {
     "نیروی دریایی": 5,
 }
 
-
 MAJOR_EVENTS = {
     "آتش بس": 10,
     "آتش‌بس": 10,
@@ -398,7 +409,6 @@ MAJOR_EVENTS = {
     "پایگاه اسرائیل": 9,
 }
 
-
 URGENT_TERMS = {
     "فوری": 8,
     "خبر فوری": 12,
@@ -414,7 +424,6 @@ URGENT_TERMS = {
     "تازه ترین": 4,
 }
 
-
 CASUALTY_TERMS = {
     "کشته": 7,
     "کشته‌ها": 7,
@@ -427,7 +436,6 @@ CASUALTY_TERMS = {
     "آتش سوزی": 5,
     "آتش‌سوزی": 5,
 }
-
 
 ANALYSIS_TERMS = {
     "تحلیل": -8,
@@ -450,7 +458,6 @@ ANALYSIS_TERMS = {
     "نگاهی به": -5,
     "گزارش تحلیلی": -9,
 }
-
 
 EXCLUDE_TERMS = {
     "ورزش": -20,
@@ -712,6 +719,26 @@ def load_sent_titles():
     )
 
 
+def title_fingerprint(title):
+    text = normalize_text(
+        title
+    )
+
+    text = re.sub(
+        r"[^\w\sآ-ی]",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    ).strip()
+
+    return text
+
+
 def save_sent_item(
     url,
     title
@@ -741,11 +768,6 @@ def save_sent_item(
                     fingerprint
                     + "\n"
                 )
-
-        log.info(
-            "SAVED SENT ITEM | %s",
-            url
-        )
 
         return True
 
@@ -812,8 +834,8 @@ def age_hours(dt):
         )
 
     delta = (
-        now
-        - dt.astimezone(
+        now -
+        dt.astimezone(
             timezone.utc
         )
     )
@@ -879,17 +901,14 @@ def discover_feeds(source):
                     or ""
                 ).lower()
 
-                if isinstance(
-                    rel,
-                    list
-                ):
-                    rel_text = " ".join(
-                        rel
-                    ).lower()
-                else:
-                    rel_text = str(
-                        rel
-                    ).lower()
+                rel_text = (
+                    " ".join(rel)
+                    if isinstance(
+                        rel,
+                        list
+                    )
+                    else str(rel)
+                ).lower()
 
                 if (
                     "alternate"
@@ -1025,6 +1044,7 @@ def parse_feed(
     for entry in parsed.entries[
         :MAX_ITEMS_PER_SOURCE
     ]:
+
         title = clean_html(
             entry.get(
                 "title",
@@ -1040,101 +1060,53 @@ def parse_feed(
         if not title or not url:
             continue
 
-        url = urljoin(
-            feed_url,
+        url = canonical_url(
             url
         )
 
-        if not same_domain(
-            url,
-            source["domain"]
-        ):
-            continue
-
-        summary = clean_html(
+        description = clean_html(
             entry.get(
                 "summary",
                 ""
             )
-            or entry.get(
-                "description",
-                ""
-            )
-            or ""
         )
 
         published = None
 
-        for key in [
+        for field in (
             "published_parsed",
             "updated_parsed",
             "created_parsed",
-        ]:
+        ):
             published = parse_datetime(
-                entry.get(key)
+                entry.get(field)
             )
 
             if published:
                 break
 
-        items.append(
-            {
-                "source": source["name"],
-                "domain": source["domain"],
-                "title": title,
-                "summary": summary,
-                "url": url,
-                "image": extract_entry_image(
-                    entry
-                ),
-                "published": published,
-                "method": "rss",
-            }
+        image = extract_entry_image(
+            entry
         )
+
+        items.append({
+            "title": title,
+            "url": url,
+            "description": description,
+            "published": published,
+            "image": image,
+            "source": source["name"],
+            "domain": source["domain"],
+        })
 
     return items
 
 
 # ============================================================
-# HTML
+# HTML FALLBACK
 # ============================================================
 
-def is_probable_article_url(url):
-    if not url:
-        return False
-
-    path = urlparse(
-        url
-    ).path.lower()
-
-    bad_parts = [
-        "/tag/",
-        "/tags/",
-        "/category/",
-        "/categories/",
-        "/author/",
-        "/search",
-        "/page/",
-        "/login",
-        "/register",
-        "/contact",
-        "/about",
-        "/gallery",
-    ]
-
-    for bad in bad_parts:
-        if bad in path:
-            return False
-
-    if len(
-        path.strip("/")
-    ) < 5:
-        return False
-
-    return True
-
-
-def scrape_homepage(source):
+def html_fallback(source):
     response = safe_get(
         source["url"]
     )
@@ -1147,699 +1119,1045 @@ def scrape_homepage(source):
             response.text,
             "html.parser"
         )
-    except Exception:
-        return []
 
-    items = []
-    seen = set()
+        items = []
 
-    anchors = []
-
-    for article in soup.find_all(
-        "article"
-    ):
-        anchors.extend(
-            article.find_all(
-                "a",
-                href=True
-            )
-        )
-
-    anchors.extend(
-        soup.find_all(
+        for a in soup.find_all(
             "a",
             href=True
-        )
-    )
-
-    for a in anchors:
-        href = a.get(
-            "href"
-        )
-
-        title = clean_html(
-            a.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        if not href or not title:
-            continue
-
-        url = urljoin(
-            response.url,
-            href
-        )
-
-        if not same_domain(
-            url,
-            source["domain"]
         ):
-            continue
-
-        if not is_probable_article_url(
-            url
-        ):
-            continue
-
-        url = canonical_url(
-            url
-        )
-
-        if url in seen:
-            continue
-
-        seen.add(url)
-
-        if len(title) < 15:
-            continue
-
-        if len(title) > 300:
-            continue
-
-        items.append(
-            {
-                "source": source["name"],
-                "domain": source["domain"],
-                "title": title,
-                "summary": "",
-                "url": url,
-                "image": "",
-                "published": None,
-                "method": "html",
-            }
-        )
-
-        if len(items) >= MAX_ITEMS_PER_SOURCE:
-            break
-
-    return items
-
-
-# ============================================================
-# ARTICLE
-# ============================================================
-
-def extract_meta(
-    soup,
-    *names
-):
-    for name in names:
-        tag = soup.find(
-            "meta",
-            attrs={
-                "name": name
-            }
-        )
-
-        if (
-            tag
-            and tag.get("content")
-        ):
-            return clean_html(
-                tag.get("content")
-            )
-
-        tag = soup.find(
-            "meta",
-            attrs={
-                "property": name
-            }
-        )
-
-        if (
-            tag
-            and tag.get("content")
-        ):
-            return clean_html(
-                tag.get("content")
-            )
-
-    return ""
-
-
-def extract_article_page(item):
-    response = safe_get(
-        item["url"]
-    )
-
-    if not response or not response.ok:
-        return item
-
-    try:
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
-    except Exception:
-        return item
-
-    title = extract_meta(
-        soup,
-        "og:title",
-        "twitter:title",
-    )
-
-    if not title and soup.title:
-        title = clean_html(
-            soup.title.get_text()
-        )
-
-    if title:
-        item["title"] = title
-
-    description = extract_meta(
-        soup,
-        "description",
-        "og:description",
-        "twitter:description",
-    )
-
-    if description:
-        item["summary"] = description
-
-    image = extract_meta(
-        soup,
-        "og:image",
-        "twitter:image",
-    )
-
-    if image:
-        item["image"] = urljoin(
-            response.url,
-            image
-        )
-
-    if len(
-        item.get(
-            "summary",
-            ""
-        )
-    ) < 80:
-
-        paragraphs = []
-
-        selectors = [
-            "article p",
-            ".article-body p",
-            ".article-content p",
-            ".news-body p",
-            ".news-content p",
-            ".body p",
-            ".content p",
-            "main p",
-        ]
-
-        for selector in selectors:
-            found = soup.select(
-                selector
-            )
-
-            if found:
-                for p in found[:8]:
-                    text = clean_html(
-                        p.get_text(
-                            " ",
-                            strip=True
-                        )
-                    )
-
-                    if len(text) >= 30:
-                        paragraphs.append(
-                            text
-                        )
-
-                if paragraphs:
-                    break
-
-        if paragraphs:
-            item["summary"] = " ".join(
-                paragraphs[:4]
-            )
-
-    if not item.get(
-        "image"
-    ):
-        for img in soup.find_all(
-            "img"
-        ):
-            src = (
-                img.get(
-                    "data-src"
-                )
-                or img.get(
-                    "data-original"
-                )
-                or img.get(
-                    "src"
+            title = clean_html(
+                a.get_text(
+                    " ",
+                    strip=True
                 )
             )
 
-            if not src:
+            href = urljoin(
+                response.url,
+                a["href"]
+            )
+
+            if len(title) < 20:
                 continue
 
-            src = urljoin(
-                response.url,
-                src
-            )
-
-            if src.startswith(
-                (
-                    "http://",
-                    "https://"
-                )
+            if not href.startswith(
+                ("http://", "https://")
             ):
-                item["image"] = src
+                continue
+
+            if not same_domain(
+                href,
+                source["domain"]
+            ):
+                continue
+
+            items.append({
+                "title": title,
+                "url": canonical_url(
+                    href
+                ),
+                "description": "",
+                "published": None,
+                "image": "",
+                "source": source["name"],
+                "domain": source["domain"],
+            })
+
+            if (
+                len(items)
+                >= MAX_ITEMS_PER_SOURCE
+            ):
                 break
 
-    return item
+        return items
+
+    except Exception:
+        return []
 
 
 # ============================================================
 # SCORING
 # ============================================================
 
-def calculate_score(item):
-    title = normalize_text(
+def score_text(text):
+    text = normalize_text(
+        text
+    )
+
+    score = 0
+    matched = []
+
+    dictionaries = [
+        CORE_ENTITIES,
+        MILITARY_ACTIONS,
+        MAJOR_EVENTS,
+        URGENT_TERMS,
+        CASUALTY_TERMS,
+        ANALYSIS_TERMS,
+        EXCLUDE_TERMS,
+    ]
+
+    for dictionary in dictionaries:
+        for keyword, value in dictionary.items():
+
+            normalized_keyword = (
+                normalize_text(keyword)
+            )
+
+            if normalized_keyword in text:
+                score += value
+                matched.append(
+                    keyword
+                )
+
+    return score, matched
+
+
+def is_analysis(text):
+    text = normalize_text(
+        text
+    )
+
+    hits = 0
+
+    for keyword in ANALYSIS_TERMS:
+        if normalize_text(keyword) in text:
+            hits += 1
+
+    return hits >= 2
+
+
+def is_excluded(text):
+    text = normalize_text(
+        text
+    )
+
+    for keyword in EXCLUDE_TERMS:
+        if normalize_text(keyword) in text:
+            return True
+
+    return False
+
+
+def is_relevant(item):
+    combined = (
+        item["title"]
+        + " "
+        + item.get(
+            "description",
+            ""
+        )
+    )
+
+    if is_excluded(combined):
+        return False
+
+    if is_analysis(combined):
+        return False
+
+    score, matched = score_text(
+        combined
+    )
+
+    item["score"] = score
+    item["matched"] = matched
+
+    return score >= MIN_SCORE
+
+
+# ============================================================
+# SIMILARITY
+# ============================================================
+
+STOPWORDS = {
+    "از",
+    "به",
+    "در",
+    "با",
+    "برای",
+    "که",
+    "و",
+    "را",
+    "این",
+    "آن",
+    "یک",
+    "های",
+    "کرد",
+    "شد",
+    "است",
+    "بر",
+    "تا",
+    "وی",
+    "او",
+    "نیز",
+    "اما",
+    "هم",
+    "یا",
+    "پس",
+}
+
+
+def title_words(title):
+    text = normalize_text(
+        title
+    )
+
+    words = re.findall(
+        r"[\wآ-ی]+",
+        text
+    )
+
+    return {
+        x
+        for x in words
+        if len(x) > 2
+        and x not in STOPWORDS
+    }
+
+
+def content_words(item):
+    text = (
         item.get(
             "title",
             ""
         )
-    )
-
-    summary = normalize_text(
-        item.get(
-            "summary",
+        + " "
+        + item.get(
+            "description",
             ""
         )
     )
 
-    text = (
-        title
-        + " "
-        + summary
-    ).strip()
-
-    score = 0
-
-    matched_entities = []
-    matched_actions = []
-    matched_major = []
-    matched_urgent = []
-
-    for phrase, value in CORE_ENTITIES.items():
-        if normalize_text(
-            phrase
-        ) in text:
-            score += value
-            matched_entities.append(
-                phrase
-            )
-
-    if not matched_entities:
-        return {
-            "score": -999,
-            "entities": [],
-            "actions": [],
-            "major": [],
-            "urgent": [],
-        }
-
-    for phrase, value in MILITARY_ACTIONS.items():
-        if normalize_text(
-            phrase
-        ) in text:
-            score += value
-            matched_actions.append(
-                phrase
-            )
-
-    for phrase, value in MAJOR_EVENTS.items():
-        if normalize_text(
-            phrase
-        ) in text:
-            score += value
-            matched_major.append(
-                phrase
-            )
-
-    for phrase, value in URGENT_TERMS.items():
-        if normalize_text(
-            phrase
-        ) in text:
-            score += value
-            matched_urgent.append(
-                phrase
-            )
-
-    for phrase, value in CASUALTY_TERMS.items():
-        if normalize_text(
-            phrase
-        ) in text:
-            score += value
-
-    for phrase, value in ANALYSIS_TERMS.items():
-        if normalize_text(
-            phrase
-        ) in text:
-            score += value
-
-    for phrase, value in EXCLUDE_TERMS.items():
-        if normalize_text(
-            phrase
-        ) in text:
-            score += value
-
-    if (
-        not matched_actions
-        and not matched_major
-    ):
-        score -= 25
-
-    analysis_found = any(
-        normalize_text(
-            phrase
-        ) in text
-        for phrase in [
-            "تحلیل",
-            "یادداشت",
-            "کارشناس",
-            "چرا",
-            "چگونه",
-            "پیش بینی",
-            "پیش‌بینی",
-        ]
+    text = normalize_text(
+        text
     )
 
-    if (
-        analysis_found
-        and not matched_major
-        and len(
-            matched_actions
-        ) < 2
-    ):
-        score -= 15
+    words = re.findall(
+        r"[\wآ-ی]+",
+        text
+    )
 
-    hours = age_hours(
+    return {
+        x
+        for x in words
+        if len(x) > 2
+        and x not in STOPWORDS
+    }
+
+
+def jaccard(set_a, set_b):
+    if not set_a or not set_b:
+        return 0.0
+
+    return len(
+        set_a & set_b
+    ) / len(
+        set_a | set_b
+    )
+
+
+def title_similarity(a, b):
+    return jaccard(
+        title_words(a),
+        title_words(b)
+    )
+
+
+def event_similarity(a, b):
+    """
+    تشخیص خبرهای مربوط به یک رویداد
+    حتی وقتی تیترها کاملاً یکسان نیستند.
+    """
+
+    title_sim = title_similarity(
+        a["title"],
+        b["title"]
+    )
+
+    content_sim = jaccard(
+        content_words(a),
+        content_words(b)
+    )
+
+    combined_text_a = normalize_text(
+        a["title"]
+        + " "
+        + a.get(
+            "description",
+            ""
+        )
+    )
+
+    combined_text_b = normalize_text(
+        b["title"]
+        + " "
+        + b.get(
+            "description",
+            ""
+        )
+    )
+
+    important_hits_a = {
+        keyword
+        for keyword in (
+            list(CORE_ENTITIES.keys())
+            + list(MILITARY_ACTIONS.keys())
+            + list(MAJOR_EVENTS.keys())
+        )
+        if normalize_text(keyword)
+        in combined_text_a
+    }
+
+    important_hits_b = {
+        keyword
+        for keyword in (
+            list(CORE_ENTITIES.keys())
+            + list(MILITARY_ACTIONS.keys())
+            + list(MAJOR_EVENTS.keys())
+        )
+        if normalize_text(keyword)
+        in combined_text_b
+    }
+
+    important_sim = jaccard(
+        important_hits_a,
+        important_hits_b
+    )
+
+    # تیتر تقریباً یکسان
+    if title_sim >= 0.70:
+        return True
+
+    # متن و کلیدواژه‌های اصلی بسیار نزدیک
+    if (
+        content_sim >= 0.48
+        and important_sim >= 0.35
+    ):
+        return True
+
+    # وقتی تیتر متفاوت است ولی عناصر اصلی یکسان‌اند
+    if (
+        title_sim >= 0.45
+        and important_sim >= 0.55
+    ):
+        return True
+
+    return False
+
+
+def item_priority(item):
+    """
+    هرچه مقدار بیشتر باشد،
+    خبر برای نگه‌داشتن اولویت بیشتری دارد.
+    """
+
+    score = item.get(
+        "score",
+        0
+    )
+
+    age = age_hours(
         item.get(
             "published"
         )
     )
 
-    if hours <= URGENT_HOURS:
-        score += 8
-    elif hours <= 12:
-        score += 4
-    elif hours <= MAX_AGE_HOURS:
-        score += 1
+    freshness_bonus = max(
+        0,
+        12 - age
+    )
 
-    return {
-        "score": score,
-        "entities": matched_entities,
-        "actions": matched_actions,
-        "major": matched_major,
-        "urgent": matched_urgent,
-    }
+    source_bonus = {
+        "ایرنا": 2,
+        "ایسنا": 2,
+        "فارس": 2,
+        "تسنیم": 2,
+        "مهر": 2,
+        "IRIB": 2,
+    }.get(
+        item.get(
+            "source"
+        ),
+        0
+    )
+
+    return (
+        score
+        + freshness_bonus
+        + source_bonus
+    )
 
 
-def is_relevant(item):
-    info = calculate_score(
+def remove_cross_source_duplicates(items):
+    """
+    اگر چند خبر از منابع مختلف درباره یک رویداد باشند،
+    فقط یک نسخه نگه داشته می‌شود.
+    """
+
+    result = []
+
+    ordered = sorted(
+        items,
+        key=item_priority,
+        reverse=True
+    )
+
+    for item in ordered:
+
+        duplicate = False
+
+        for existing in result:
+
+            # اگر دقیقاً یک URL باشند
+            if (
+                canonical_url(
+                    item["url"]
+                )
+                ==
+                canonical_url(
+                    existing["url"]
+                )
+            ):
+                duplicate = True
+                break
+
+            # اگر یک رویداد باشند
+            if event_similarity(
+                item,
+                existing
+            ):
+                duplicate = True
+
+                log.info(
+                    "CROSS SOURCE DUPLICATE | %s | %s | kept=%s",
+                    item["source"],
+                    item["title"],
+                    existing["source"]
+                )
+
+                break
+
+        if not duplicate:
+            result.append(
+                item
+            )
+
+    return result
+
+
+# ============================================================
+# ARTICLE IMAGE
+# ============================================================
+
+def find_article_image(item):
+
+    if item.get("image"):
+        return item["image"]
+
+    response = safe_get(
+        item["url"]
+    )
+
+    if not response or not response.ok:
+        return ""
+
+    try:
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser"
+        )
+
+        og = soup.find(
+            "meta",
+            property="og:image"
+        )
+
+        if (
+            og
+            and og.get("content")
+        ):
+            return urljoin(
+                response.url,
+                og["content"]
+            )
+
+        twitter = soup.find(
+            "meta",
+            attrs={
+                "name": "twitter:image"
+            }
+        )
+
+        if (
+            twitter
+            and twitter.get(
+                "content"
+            )
+        ):
+            return urljoin(
+                response.url,
+                twitter["content"]
+            )
+
+        for img in soup.find_all(
+            "img",
+            src=True
+        ):
+            src = urljoin(
+                response.url,
+                img["src"]
+            )
+
+            if src.startswith(
+                ("http://", "https://")
+            ):
+                return src
+
+    except Exception:
+        pass
+
+    return ""
+
+
+def download_image(url):
+
+    if not url:
+        return ""
+
+    try:
+        response = safe_get(
+            url,
+            timeout=15
+        )
+
+        if (
+            not response
+            or not response.ok
+        ):
+            return ""
+
+        content_type = (
+            response.headers.get(
+                "content-type",
+                ""
+            ).lower()
+        )
+
+        if (
+            "image"
+            not in content_type
+            and not url.lower().endswith(
+                (
+                    ".jpg",
+                    ".jpeg",
+                    ".png",
+                    ".webp"
+                )
+            )
+        ):
+            return ""
+
+        filename = os.path.join(
+            BASE_DIR,
+            "_news_image.jpg"
+        )
+
+        with open(
+            filename,
+            "wb"
+        ) as f:
+            f.write(
+                response.content
+            )
+
+        return filename
+
+    except Exception as e:
+
+        log.warning(
+            "Image download failed | %s",
+            e
+        )
+
+        return ""
+
+
+# ============================================================
+# LOGO
+# ============================================================
+
+def add_logo(image_path):
+
+    if (
+        Image is None
+        or not image_path
+        or not os.path.exists(
+            LOGO_FILE
+        )
+    ):
+        return image_path
+
+    try:
+
+        base = Image.open(
+            image_path
+        ).convert(
+            "RGBA"
+        )
+
+        logo = Image.open(
+            LOGO_FILE
+        ).convert(
+            "RGBA"
+        )
+
+        max_width = max(
+            80,
+            int(
+                base.width * 0.18
+            )
+        )
+
+        ratio = (
+            max_width
+            / logo.width
+        )
+
+        logo = logo.resize(
+            (
+                max_width,
+                int(
+                    logo.height
+                    * ratio
+                ),
+            ),
+            Image.LANCZOS
+        )
+
+        margin = 20
+
+        position = (
+            base.width
+            - logo.width
+            - margin,
+            base.height
+            - logo.height
+            - margin,
+        )
+
+        base.alpha_composite(
+            logo,
+            position
+        )
+
+        output = os.path.join(
+            BASE_DIR,
+            "_news_final.jpg"
+        )
+
+        base.convert(
+            "RGB"
+        ).save(
+            output,
+            "JPEG",
+            quality=92
+        )
+
+        return output
+
+    except Exception as e:
+
+        log.warning(
+            "Logo failed | %s",
+            e
+        )
+
+        return image_path
+
+
+# ============================================================
+# TELEGRAM CAPTION
+# ============================================================
+
+def escape_html(text):
+    return html.escape(
+        str(text or ""),
+        quote=False
+    )
+
+
+def format_time(dt):
+
+    if not dt:
+        return "نامشخص"
+
+    try:
+        return dt.astimezone(
+            timezone.utc
+        ).strftime(
+            "%H:%M"
+        )
+
+    except Exception:
+        return "نامشخص"
+
+
+def is_urgent(item):
+
+    text = normalize_text(
+        item["title"]
+        + " "
+        + item.get(
+            "description",
+            ""
+        )
+    )
+
+    if (
+        age_hours(
+            item.get(
+                "published"
+            )
+        )
+        <= URGENT_HOURS
+    ):
+
+        for keyword in URGENT_TERMS:
+
+            if (
+                normalize_text(
+                    keyword
+                )
+                in text
+            ):
+                return True
+
+    return False
+
+
+def build_caption(item):
+
+    urgent = is_urgent(
         item
     )
 
-    item["score"] = info["score"]
-
-    item["matched_entities"] = (
-        info["entities"]
+    title = escape_html(
+        shorten(
+            item["title"],
+            220
+        )
     )
 
-    item["matched_actions"] = (
-        info["actions"]
+    description = shorten(
+        item.get(
+            "description",
+            ""
+        ),
+        430
     )
 
-    item["matched_major"] = (
-        info["major"]
+    if description:
+        description = escape_html(
+            description
+        )
+
+    source = escape_html(
+        item["source"]
     )
 
-    item["matched_urgent"] = (
-        info["urgent"]
+    time_text = format_time(
+        item.get(
+            "published"
+        )
     )
 
-    if info["score"] < MIN_SCORE:
-        return False
+    if urgent:
+        header = (
+            "🚨 <b>خبر فوری</b>"
+        )
+    else:
+        header = (
+            "📰 <b>خبر جدید</b>"
+        )
 
-    if (
-        not info["actions"]
-        and not info["major"]
-    ):
-        return False
-
-    return True
-
-
-# ============================================================
-# TITLE FINGERPRINT
-# ============================================================
-
-def title_fingerprint(title):
-    text = normalize_text(
-        title
-    )
-
-    text = re.sub(
-        r"[^\w\sآ-ی]",
-        " ",
-        text
-    )
-
-    stopwords = {
-        "خبر",
-        "جدید",
-        "آخرین",
-        "اعلام",
-        "شد",
-        "شدند",
-        "کرد",
-        "کردند",
-        "کرده",
-        "می",
-        "شود",
-        "شده",
-        "در",
-        "به",
-        "از",
-        "با",
-        "برای",
-        "و",
-        "یک",
-        "این",
-        "آن",
-        "را",
-        "که",
-        "بر",
-        "تا",
-        "اما",
-        "نیز",
-    }
-
-    words = [
-        word
-        for word in text.split()
-        if word not in stopwords
+    lines = [
+        header,
+        "",
+        f"<b>{title}</b>",
+        "",
+        "━━━━━━━━━━━━━━",
+        f"🗞 <b>منبع:</b> {source}",
+        f"🕐 <b>زمان:</b> {time_text}",
+        "━━━━━━━━━━━━━━",
     ]
 
-    # مرتب‌سازی باعث می‌شود
-    # تفاوت جزئی ترتیب کلمات هم
-    # باعث عبور خبر تکراری نشود.
-    words = sorted(
-        set(words)
+    if description:
+        lines.extend(
+            [
+                "",
+                description,
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "━━━━━━━━━━━━━━",
+            "🌐 <b>جهان‌تاب | آخرین تحولات جهان</b>",
+        ]
     )
 
-    return " ".join(
-        words[:30]
+    return "\n".join(
+        lines
     )
-
-
-def title_tokens(title):
-    fingerprint = title_fingerprint(
-        title
-    )
-
-    return set(
-        fingerprint.split()
-    )
-
-
-def titles_are_similar(
-    title1,
-    title2,
-    threshold=0.72
-):
-    tokens1 = title_tokens(
-        title1
-    )
-
-    tokens2 = title_tokens(
-        title2
-    )
-
-    if not tokens1 or not tokens2:
-        return False
-
-    intersection = len(
-        tokens1 & tokens2
-    )
-
-    union = len(
-        tokens1 | tokens2
-    )
-
-    if union == 0:
-        return False
-
-    similarity = (
-        intersection
-        / union
-    )
-
-    return similarity >= threshold
 
 
 # ============================================================
-# DEDUPLICATION
+# TELEGRAM API
 # ============================================================
 
-def dedupe_items(
-    items,
-    sent_links,
-    sent_titles
+def telegram_url(method):
+
+    return (
+        "https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/{method}"
+    )
+
+
+def telegram_request(
+    method,
+    payload=None,
+    files=None
 ):
-    result = []
 
-    seen_urls = set()
-    seen_titles = set()
+    try:
 
-    # خبرهای با امتیاز بالاتر
-    # زودتر بررسی می‌شوند.
-    items = sorted(
-        items,
-        key=lambda x: (
-            x.get(
-                "score",
-                0
+        response = requests.post(
+            telegram_url(
+                method
             ),
-            -age_hours(
-                x.get(
-                    "published"
+            data=payload,
+            files=files,
+            timeout=30
+        )
+
+        data = response.json()
+
+        if not data.get("ok"):
+
+            log.error(
+                "Telegram error | %s",
+                data
+            )
+
+        return data
+
+    except Exception as e:
+
+        log.error(
+            "Telegram request failed | %s",
+            e
+        )
+
+        return {
+            "ok": False,
+            "description": str(e)
+        }
+
+
+def send_photo(
+    image_path,
+    caption,
+    article_url
+):
+
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "🔗 مشاهده خبر",
+                    "url": article_url
+                }
+            ]
+        ]
+    }
+
+    reply_markup = json.dumps(
+        keyboard,
+        ensure_ascii=False
+    )
+
+    payload = {
+        "chat_id": CHAT_ID,
+        "caption": caption,
+        "parse_mode": "HTML",
+        "reply_markup": reply_markup,
+    }
+
+    try:
+
+        if (
+            image_path
+            and os.path.exists(
+                image_path
+            )
+        ):
+
+            with open(
+                image_path,
+                "rb"
+            ) as photo:
+
+                result = telegram_request(
+                    "sendPhoto",
+                    payload=payload,
+                    files={
+                        "photo": photo
+                    }
                 )
-            ),
-        ),
-        reverse=True,
-    )
+
+        else:
+
+            result = telegram_request(
+                "sendMessage",
+                payload={
+                    "chat_id": CHAT_ID,
+                    "text": caption,
+                    "parse_mode": "HTML",
+                    "reply_markup": reply_markup,
+                }
+            )
+
+        return result.get(
+            "ok",
+            False
+        )
+
+    except Exception as e:
+
+        log.error(
+            "Send failed | %s",
+            e
+        )
+
+        return False
+
+
+# ============================================================
+# COLLECT
+# ============================================================
+
+def collect_items():
+
+    all_items = []
+
+    for source in SOURCES:
+
+        log.info(
+            "Checking source | %s",
+            source["name"]
+        )
+
+        source_items = []
+
+        feeds = discover_feeds(
+            source
+        )
+
+        for feed in feeds:
+
+            parsed = parse_feed(
+                source,
+                feed
+            )
+
+            if parsed:
+
+                source_items.extend(
+                    parsed
+                )
+
+                if (
+                    len(source_items)
+                    >= MAX_ITEMS_PER_SOURCE
+                ):
+                    break
+
+        if not source_items:
+
+            source_items = html_fallback(
+                source
+            )
+
+        unique = {}
+
+        for item in source_items:
+
+            key = canonical_url(
+                item["url"]
+            )
+
+            if key:
+                unique[key] = item
+
+        all_items.extend(
+            list(
+                unique.values()
+            )[
+                :MAX_ITEMS_PER_SOURCE
+            ]
+        )
+
+    return all_items
+
+
+# ============================================================
+# FILTER
+# ============================================================
+
+def filter_items(items):
+
+    sent_links = load_sent_links()
+    sent_titles = load_sent_titles()
+
+    result = []
 
     for item in items:
 
         url = canonical_url(
-            item.get(
-                "url",
-                ""
-            )
+            item["url"]
         )
-
-        title = clean_html(
-            item.get(
-                "title",
-                ""
-            )
-        )
-
-        if not url or not title:
-            continue
-
-        # ----------------------------------------------------
-        # لینک قبلاً ارسال شده
-        # ----------------------------------------------------
-
-        if url in sent_links:
-            log.info(
-                "DUPLICATE LINK | %s",
-                title
-            )
-            continue
-
-        # ----------------------------------------------------
-        # عنوان قبلاً ارسال شده
-        # ----------------------------------------------------
 
         fingerprint = title_fingerprint(
-            title
+            item["title"]
         )
+
+        if not url:
+            continue
+
+        if url in sent_links:
+            continue
 
         if (
             fingerprint
             and fingerprint in sent_titles
         ):
-            log.info(
-                "DUPLICATE TITLE HISTORY | %s",
-                title
+            continue
+
+        age = age_hours(
+            item.get(
+                "published"
             )
-            continue
-
-        # ----------------------------------------------------
-        # تکراری داخل همین اجرای Bot
-        # ----------------------------------------------------
-
-        if url in seen_urls:
-            continue
-
-        if (
-            fingerprint
-            and fingerprint in seen_titles
-        ):
-            log.info(
-                "DUPLICATE CURRENT RUN | %s",
-                title
-            )
-            continue
-
-        # ----------------------------------------------------
-        # شباهت عنوان با خبرهای همین اجرا
-        # ----------------------------------------------------
-
-        similar = False
-
-        for old_item in result:
-            old_title = old_item.get(
-                "title",
-                ""
-            )
-
-            if titles_are_similar(
-                title,
-                old_title,
-                threshold=0.72
-            ):
-                log.info(
-                    "SIMILAR NEWS | %s | %s",
-                    title,
-                    old_title
-                )
-
-                similar = True
-                break
-
-        if similar:
-            continue
-
-        seen_urls.add(
-            url
         )
 
-        if fingerprint:
-            seen_titles.add(
-                fingerprint
-            )
+        if age > MAX_AGE_HOURS:
+            continue
+
+        if not is_relevant(
+            item
+        ):
+            continue
 
         result.append(
             item
@@ -1849,644 +2167,19 @@ def dedupe_items(
 
 
 # ============================================================
-# COLLECT
+# SORT
 # ============================================================
 
-def collect_from_source(
-    source,
-    sent_links,
-    sent_titles
-):
-    items = []
+def sort_items(items):
 
-    feeds = discover_feeds(
-        source
-    )
-
-    for feed_url in feeds:
-        try:
-            rss_items = parse_feed(
-                source,
-                feed_url
-            )
-
-            if rss_items:
-                items.extend(
-                    rss_items
-                )
-                break
-
-        except Exception as e:
-            log.debug(
-                "RSS error | %s | %s",
-                source["name"],
-                e
-            )
-
-    if not items:
-        items = scrape_homepage(
-            source
-        )
-
-    fresh = []
-
-    for item in items:
-        url = canonical_url(
-            item.get(
-                "url",
-                ""
-            )
-        )
-
-        title = item.get(
-            "title",
-            ""
-        )
-
-        if not url:
-            continue
-
-        if url in sent_links:
-            continue
-
-        fingerprint = title_fingerprint(
-            title
-        )
-
-        if (
-            fingerprint
-            and fingerprint in sent_titles
-        ):
-            continue
-
-        fresh.append(
-            item
-        )
-
-    return fresh
-
-
-def collect_all_news(
-    sent_links,
-    sent_titles
-):
-    all_items = []
-
-    for source in SOURCES:
-        try:
-            log.info(
-                "SOURCE | %s",
-                source["name"]
-            )
-
-            items = collect_from_source(
-                source,
-                sent_links,
-                sent_titles
-            )
-
-            log.info(
-                "FOUND | %s | %d",
-                source["name"],
-                len(items)
-            )
-
-            all_items.extend(
-                items
-            )
-
-        except Exception as e:
-            log.exception(
-                "SOURCE ERROR | %s | %s",
-                source["name"],
-                e
-            )
-
-    return all_items
-
-
-# ============================================================
-# ENRICH
-# ============================================================
-
-def enrich_candidates(items):
-    candidates = []
-
-    for item in items:
-        quick = calculate_score(
-            item
-        )
-
-        if quick["score"] < 5:
-            continue
-
-        candidates.append(
-            item
-        )
-
-    candidates.sort(
-        key=lambda x: (
-            calculate_score(
-                x
-            )["score"],
-            -age_hours(
-                x.get(
-                    "published"
-                )
-            ),
-        ),
-        reverse=True,
-    )
-
-    candidates = candidates[:80]
-
-    result = []
-
-    for item in candidates:
-        try:
-            item = extract_article_page(
-                item
-            )
-
-            if is_relevant(
-                item
-            ):
-                result.append(
-                    item
-                )
-
-        except Exception as e:
-            log.debug(
-                "ARTICLE ERROR | %s | %s",
-                item.get("url"),
-                e
-            )
-
-    return result
-
-
-# ============================================================
-# IMAGE
-# ============================================================
-
-def find_logo_file():
-    candidates = [
-        LOGO_FILE,
-        os.path.join(
-            BASE_DIR,
-            "logo.png"
-        ),
-        os.path.join(
-            BASE_DIR,
-            "logo.jpg"
-        ),
-        os.path.join(
-            BASE_DIR,
-            "logo.jpeg"
-        ),
-    ]
-
-    for path in candidates:
-        if os.path.isfile(
-            path
-        ):
-            return path
-
-    return None
-
-
-def download_image(url):
-    if not url:
-        return None
-
-    response = safe_get(
-        url,
-        timeout=15,
-        headers={
-            **HEADERS,
-            "Accept": (
-                "image/avif,"
-                "image/webp,"
-                "image/apng,"
-                "image/svg+xml,"
-                "image/*,"
-                "*/*;q=0.8"
-            ),
-        },
-    )
-
-    if not response or not response.ok:
-        log.warning(
-            "IMAGE DOWNLOAD FAILED | %s",
-            url
-        )
-        return None
-
-    content_type = (
-        response.headers
-        .get(
-            "content-type",
-            ""
-        )
-        .lower()
-    )
-
-    if (
-        "image" not in content_type
-        and not response.content.startswith(
-            (
-                b"\xff\xd8",
-                b"\x89PNG",
-                b"RIFF"
-            )
-        )
-    ):
-        return None
-
-    if len(
-        response.content
-    ) > 15 * 1024 * 1024:
-        log.warning(
-            "IMAGE TOO LARGE | %s",
-            url
-        )
-        return None
-
-    return response.content
-
-
-def watermark_image(
-    image_bytes
-):
-    if not image_bytes:
-        return image_bytes
-
-    if Image is None:
-        log.error(
-            "Pillow is not installed."
-        )
-        return image_bytes
-
-    logo_path = find_logo_file()
-
-    if not logo_path:
-        log.error(
-            "LOGO NOT FOUND | searched in %s",
-            BASE_DIR
-        )
-        return image_bytes
-
-    try:
-        from io import BytesIO
-
-        base = Image.open(
-            BytesIO(image_bytes)
-        ).convert(
-            "RGBA"
-        )
-
-        logo = Image.open(
-            logo_path
-        ).convert(
-            "RGBA"
-        )
-
-        if (
-            logo.width <= 0
-            or logo.height <= 0
-        ):
-            return image_bytes
-
-        target_width = max(
-            140,
-            int(
-                base.width * 0.22
-            )
-        )
-
-        target_width = min(
-            target_width,
-            int(
-                base.width * 0.35
-            )
-        )
-
-        ratio = (
-            target_width
-            / logo.width
-        )
-
-        target_height = max(
-            1,
-            int(
-                logo.height * ratio
-            )
-        )
-
-        logo = logo.resize(
-            (
-                target_width,
-                target_height
-            ),
-            Image.LANCZOS
-        )
-
-        # کمی شفاف‌تر تا عکس اصلی دیده شود.
-        alpha = logo.getchannel(
-            "A"
-        )
-
-        alpha = alpha.point(
-            lambda p: int(
-                p * 0.90
-            )
-        )
-
-        logo.putalpha(
-            alpha
-        )
-
-        margin = max(
-            15,
-            int(
-                base.width * 0.025
-            )
-        )
-
-        x = (
-            base.width
-            - logo.width
-            - margin
-        )
-
-        y = (
-            base.height
-            - logo.height
-            - margin
-        )
-
-        base.alpha_composite(
-            logo,
-            (
-                x,
-                y
-            )
-        )
-
-        output = BytesIO()
-
-        base.convert(
-            "RGB"
-        ).save(
-            output,
-            format="JPEG",
-            quality=95,
-            optimize=True
-        )
-
-        result = output.getvalue()
-
-        log.info(
-            "LOGO ADDED | %s",
-            logo_path
-        )
-
-        return result
-
-    except Exception as e:
-        log.exception(
-            "WATERMARK ERROR | %s",
-            e
-        )
-
-        return image_bytes
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def telegram_api(
-    method,
-    data=None,
-    files=None
-):
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN is not set."
-        )
-
-    url = (
-        "https://api.telegram.org/bot"
-        + BOT_TOKEN
-        + "/"
-        + method
-    )
-
-    try:
-        return requests.post(
-            url,
-            data=data,
-            files=files,
-            timeout=30
-        )
-
-    except requests.RequestException as e:
-        log.error(
-            "Telegram request failed | %s",
-            e
-        )
-        return None
-
-
-def send_message(text):
-    response = telegram_api(
-        "sendMessage",
-        data={
-            "chat_id": CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "false",
-        }
-    )
-
-    if not response:
-        return False
-
-    if not response.ok:
-        log.error(
-            "sendMessage failed | %s",
-            response.text[:500]
-        )
-        return False
-
-    return True
-
-
-def send_photo(
-    image_bytes,
-    caption
-):
-    if not image_bytes:
-        return send_message(
-            caption
-        )
-
-    files = {
-        "photo": (
-            "jahantab.jpg",
-            image_bytes,
-            "image/jpeg"
-        )
-    }
-
-    data = {
-        "chat_id": CHAT_ID,
-        "caption": caption,
-        "parse_mode": "HTML",
-    }
-
-    response = telegram_api(
-        "sendPhoto",
-        data=data,
-        files=files
-    )
-
-    if not response:
-        return False
-
-    if not response.ok:
-        log.error(
-            "sendPhoto failed | %s",
-            response.text[:500]
-        )
-        return False
-
-    return True
-
-
-# ============================================================
-# CAPTION
-# ============================================================
-
-def build_caption(item):
-    title = clean_html(
-        item.get(
-            "title",
-            ""
-        )
-    )
-
-    summary = clean_html(
-        item.get(
-            "summary",
-            ""
-        )
-    )
-
-    source = clean_html(
-        item.get(
-            "source",
-            ""
-        )
-    )
-
-    url = item.get(
-        "url",
-        ""
-    )
-
-    if summary:
-        summary = shorten(
-            summary,
-            500
-        )
-    else:
-        summary = (
-            "جزئیات بیشتر "
-            "در لینک خبر."
-        )
-
-    caption = (
-        "🟥 <b>خبر فوری</b>\n\n"
-        f"<b>{html.escape(title)}</b>\n\n"
-        f"{html.escape(summary)}\n\n"
-        f"📰 منبع: "
-        f"<b>{html.escape(source)}</b>\n"
-        f"🔗 <a href=\""
-        f"{html.escape(url, quote=True)}"
-        f"\">مشاهده خبر اصلی</a>\n\n"
-        "— @jahantab_news"
-    )
-
-    if len(caption) > 1024:
-        summary = shorten(
-            summary,
-            300
-        )
-
-        caption = (
-            "🟥 <b>خبر فوری</b>\n\n"
-            f"<b>{html.escape(title)}</b>\n\n"
-            f"{html.escape(summary)}\n\n"
-            f"📰 منبع: "
-            f"<b>{html.escape(source)}</b>\n"
-            f"🔗 <a href=\""
-            f"{html.escape(url, quote=True)}"
-            f"\">خبر اصلی</a>\n\n"
-            "— @jahantab_news"
-        )
-
-    return caption[:1024]
-
-
-# ============================================================
-# FINAL SELECTION
-# ============================================================
-
-def final_sort_key(item):
-    score = item.get(
-        "score",
-        0
-    )
-
-    hours = age_hours(
-        item.get(
-            "published"
-        )
-    )
-
-    freshness_bonus = max(
-        0,
-        24 - hours
-    )
-
-    return (
-        score * 10
-        + freshness_bonus,
-        -hours
-    )
-
-
-def select_best(
-    items,
-    sent_links,
-    sent_titles
-):
-    items = dedupe_items(
+    return sorted(
         items,
-        sent_links,
-        sent_titles
-    )
-
-    items.sort(
-        key=final_sort_key,
+        key=lambda x: (
+            1 if is_urgent(x) else 0,
+            item_priority(x),
+        ),
         reverse=True
     )
-
-    return items[
-        :MAX_POSTS_PER_RUN
-    ]
 
 
 # ============================================================
@@ -2494,244 +2187,160 @@ def select_best(
 # ============================================================
 
 def main():
+
+    if not BOT_TOKEN:
+
+        raise RuntimeError(
+            "BOT_TOKEN تنظیم نشده است."
+        )
+
     log.info(
-        "=" * 70
+        "========================================"
     )
 
     log.info(
-        "JAHANTAB NEWS BOT START"
+        "JAHANTAB Telegram Bot started"
     )
 
     log.info(
-        "BASE DIR | %s",
-        BASE_DIR
-    )
-
-    log.info(
-        "CHAT ID | %s",
+        "Channel: %s",
         CHAT_ID
     )
 
-    logo = find_logo_file()
+    # --------------------------------------------------------
+    # دریافت خبرها
+    # --------------------------------------------------------
+
+    items = collect_items()
 
     log.info(
-        "LOGO | %s",
-        logo or "NOT FOUND"
-    )
-
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN environment variable is missing."
-        )
-
-    sent_links = load_sent_links()
-    sent_titles = load_sent_titles()
-
-    log.info(
-        "SENT LINKS | %d",
-        len(sent_links)
-    )
-
-    log.info(
-        "SENT TITLES | %d",
-        len(sent_titles)
+        "Collected: %s",
+        len(items)
     )
 
     # --------------------------------------------------------
-    # جمع‌آوری
+    # فیلتر اولیه
     # --------------------------------------------------------
 
-    candidates = collect_all_news(
-        sent_links,
-        sent_titles
+    items = filter_items(
+        items
     )
 
     log.info(
-        "RAW CANDIDATES | %d",
-        len(candidates)
+        "After filtering: %s",
+        len(items)
     )
 
-    if not candidates:
-        log.info(
-            "NO NEW CANDIDATES"
-        )
-        return
-
     # --------------------------------------------------------
-    # استخراج اطلاعات کامل خبر
+    # حذف خبرهای تکراری بین منابع
     # --------------------------------------------------------
 
-    relevant = enrich_candidates(
-        candidates
+    items = remove_cross_source_duplicates(
+        items
     )
 
     log.info(
-        "RELEVANT | %d",
-        len(relevant)
+        "After cross-source duplicate filter: %s",
+        len(items)
     )
 
-    if not relevant:
-        log.info(
-            "NO IMPORTANT WAR NEWS"
-        )
-        return
-
     # --------------------------------------------------------
-    # حذف تکراری
+    # مرتب‌سازی
     # --------------------------------------------------------
 
-    selected = select_best(
-        relevant,
-        sent_links,
-        sent_titles
+    items = sort_items(
+        items
     )
+
+    items = items[
+        :MAX_POSTS_PER_RUN
+    ]
 
     log.info(
-        "SELECTED | %d",
-        len(selected)
+        "Selected: %s",
+        len(items)
     )
 
-    if not selected:
-        log.info(
-            "NOTHING NEW TO PUBLISH"
-        )
-        return
+    sent_count = 0
 
     # --------------------------------------------------------
     # ارسال
     # --------------------------------------------------------
 
-    sent_count = 0
-
-    for item in selected:
+    for item in items:
 
         try:
-            title = item.get(
-                "title",
-                ""
+
+            image_url = find_article_image(
+                item
             )
 
-            url = item.get(
-                "url",
-                ""
+            image_path = download_image(
+                image_url
             )
 
-            log.info(
-                "PUBLISH | score=%s | source=%s | title=%s",
-                item.get("score"),
-                item.get("source"),
-                title
-            )
+            if image_path:
 
-            # یک بررسی نهایی درست قبل از ارسال
-            current_sent_links = (
-                load_sent_links()
-            )
-
-            current_sent_titles = (
-                load_sent_titles()
-            )
-
-            if (
-                canonical_url(url)
-                in current_sent_links
-            ):
-                log.info(
-                    "SKIP - ALREADY SENT | %s",
-                    title
+                image_path = add_logo(
+                    image_path
                 )
-                continue
-
-            fingerprint = title_fingerprint(
-                title
-            )
-
-            if (
-                fingerprint
-                and fingerprint
-                in current_sent_titles
-            ):
-                log.info(
-                    "SKIP - TITLE ALREADY SENT | %s",
-                    title
-                )
-                continue
 
             caption = build_caption(
                 item
             )
 
-            image_bytes = None
+            success = send_photo(
+                image_path,
+                caption,
+                item["url"]
+            )
 
-            if item.get(
-                "image"
-            ):
-                image_bytes = download_image(
-                    item["image"]
-                )
-
-            if image_bytes:
-                image_bytes = watermark_image(
-                    image_bytes
-                )
-
-                success = send_photo(
-                    image_bytes,
-                    caption
-                )
-
-            else:
-                success = send_message(
-                    caption
-                )
-
-            # فقط اگر Telegram موفق بود
-            # خبر به عنوان ارسال‌شده ثبت می‌شود.
             if success:
 
-                if save_sent_item(
-                    url,
-                    title
-                ):
-                    sent_count += 1
-
-                log.info(
-                    "PUBLISHED SUCCESSFULLY | %s",
-                    url
+                save_sent_item(
+                    item["url"],
+                    item["title"]
                 )
 
-                time.sleep(2)
+                sent_count += 1
+
+                log.info(
+                    "POSTED | %s | %s",
+                    item["source"],
+                    item["title"]
+                )
+
+                time.sleep(
+                    POST_DELAY
+                )
 
             else:
+
                 log.error(
-                    "PUBLISH FAILED | %s",
-                    url
+                    "Could not post | %s",
+                    item["title"]
                 )
 
         except Exception as e:
+
             log.exception(
-                "PUBLISH ERROR | %s | %s",
-                item.get("url"),
+                "Item processing failed | %s",
                 e
             )
 
     log.info(
-        "=" * 70
+        "========================================"
     )
 
     log.info(
-        "PUBLISHED TOTAL | %d",
+        "Finished | sent=%s",
         sent_count
     )
 
-    log.info(
-        "JAHANTAB NEWS BOT END"
-    )
 
-    log.info(
-        "=" * 70
-    )
-
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     main()
