@@ -15,29 +15,55 @@ permissions:
 
 jobs:
   run-bot:
+
     runs-on: ubuntu-latest
 
     steps:
+
+      # ==========================================
+      # CHECKOUT
+      # ==========================================
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+
+      # ==========================================
+      # PYTHON
+      # ==========================================
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+
+      # ==========================================
+      # DEPENDENCIES
+      # ==========================================
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 feedparser pillow
 
-      - name: Prepare deduplication files
+
+      # ==========================================
+      # PREPARE STATE FILES
+      # ==========================================
+
+      - name: Prepare state files
         run: |
+
           echo "=========================================="
-          echo "JAHANTAB DEDUPLICATION STATUS"
+          echo "JAHANTAB STATE"
           echo "=========================================="
+
+          # --------------------------------------
+          # SENT LINKS
+          # --------------------------------------
 
           if [ ! -f sent_links.txt ]; then
             echo "sent_links.txt not found."
@@ -45,9 +71,16 @@ jobs:
             touch sent_links.txt
           else
             echo "sent_links.txt found."
+
             COUNT=$(grep -cve '^[[:space:]]*$' sent_links.txt || true)
+
             echo "Saved links: $COUNT"
           fi
+
+
+          # --------------------------------------
+          # SENT TITLES
+          # --------------------------------------
 
           if [ ! -f sent_titles.txt ]; then
             echo "sent_titles.txt not found."
@@ -55,51 +88,117 @@ jobs:
             touch sent_titles.txt
           else
             echo "sent_titles.txt found."
+
             COUNT=$(grep -cve '^[[:space:]]*$' sent_titles.txt || true)
+
             echo "Saved titles: $COUNT"
           fi
 
+
+          # --------------------------------------
+          # LAST PUBLISH
+          # --------------------------------------
+
+          if [ ! -f last_publish.txt ]; then
+            echo "last_publish.txt not found."
+            echo "Creating it..."
+            touch last_publish.txt
+          else
+            echo "last_publish.txt found."
+
+            echo "Last publish state:"
+            cat last_publish.txt || true
+          fi
+
+
           echo "=========================================="
+
+
+      # ==========================================
+      # RUN BOT
+      # ==========================================
 
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+
         run: |
           python -u bot.py
 
-      - name: Save deduplication files
+
+      # ==========================================
+      # SAVE STATE
+      # ==========================================
+
+      - name: Save bot state
         if: always()
         run: |
+
           echo "=========================================="
-          echo "SAVING JAHANTAB DEDUPLICATION DATA"
+          echo "SAVING JAHANTAB BOT STATE"
           echo "=========================================="
+
+
+          # --------------------------------------
+          # MAKE SURE FILES EXIST
+          # --------------------------------------
 
           if [ ! -f sent_links.txt ]; then
             echo "sent_links.txt does not exist."
             touch sent_links.txt
           fi
 
+
           if [ ! -f sent_titles.txt ]; then
             echo "sent_titles.txt does not exist."
             touch sent_titles.txt
           fi
+
+
+          if [ ! -f last_publish.txt ]; then
+            echo "last_publish.txt does not exist."
+            touch last_publish.txt
+          fi
+
+
+          # --------------------------------------
+          # GIT CONFIG
+          # --------------------------------------
 
           git config user.name "github-actions[bot]"
 
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
+
+          # --------------------------------------
+          # ADD STATE FILES
+          # --------------------------------------
+
           git add sent_links.txt
           git add sent_titles.txt
+          git add last_publish.txt
+
+
+          # --------------------------------------
+          # COMMIT / PUSH
+          # --------------------------------------
 
           if git diff --cached --quiet; then
-            echo "No changes to deduplication files."
+
+            echo "No state changes to save."
+
           else
+
             git commit \
-              -m "Update JAHANTAB deduplication data"
+              -m "Update JAHANTAB bot state"
+
             git push
-            echo "Deduplication files successfully saved."
+
+            echo "Bot state successfully saved."
+
           fi
+
 
           echo "=========================================="
