@@ -51,65 +51,34 @@ jobs:
 
 
       # ==========================================
-      # PREPARE STATE FILES
+      # PREPARE STATE
       # ==========================================
 
-      - name: Prepare state files
+      - name: Prepare state
         run: |
 
           echo "=========================================="
           echo "JAHANTAB STATE"
           echo "=========================================="
 
-          # --------------------------------------
-          # SENT LINKS
-          # --------------------------------------
+          mkdir -p state
 
-          if [ ! -f sent_links.txt ]; then
-            echo "sent_links.txt not found."
-            echo "Creating it..."
-            touch sent_links.txt
-          else
-            echo "sent_links.txt found."
+          # اگر فایل‌های قدیمی در ریشه وجود داشته باشند،
+          # bot.py خودش آنها را به state منتقل می‌کند.
 
-            COUNT=$(grep -cve '^[[:space:]]*$' sent_links.txt || true)
+          touch state/sent_links.txt
+          touch state/sent_titles.txt
+          touch state/sent_hashes.txt
+          touch state/last_publish.txt
 
-            echo "Saved links: $COUNT"
-          fi
+          echo "State directory:"
+          ls -la state
 
+          echo "Saved links:"
+          grep -cve '^[[:space:]]*$' state/sent_links.txt || true
 
-          # --------------------------------------
-          # SENT TITLES
-          # --------------------------------------
-
-          if [ ! -f sent_titles.txt ]; then
-            echo "sent_titles.txt not found."
-            echo "Creating it..."
-            touch sent_titles.txt
-          else
-            echo "sent_titles.txt found."
-
-            COUNT=$(grep -cve '^[[:space:]]*$' sent_titles.txt || true)
-
-            echo "Saved titles: $COUNT"
-          fi
-
-
-          # --------------------------------------
-          # LAST PUBLISH
-          # --------------------------------------
-
-          if [ ! -f last_publish.txt ]; then
-            echo "last_publish.txt not found."
-            echo "Creating it..."
-            touch last_publish.txt
-          else
-            echo "last_publish.txt found."
-
-            echo "Last publish state:"
-            cat last_publish.txt || true
-          fi
-
+          echo "Saved titles:"
+          grep -cve '^[[:space:]]*$' state/sent_titles.txt || true
 
           echo "=========================================="
 
@@ -139,27 +108,32 @@ jobs:
           echo "SAVING JAHANTAB BOT STATE"
           echo "=========================================="
 
+          mkdir -p state
 
           # --------------------------------------
-          # MAKE SURE FILES EXIST
+          # MAKE SURE STATE FILES EXIST
           # --------------------------------------
 
-          if [ ! -f sent_links.txt ]; then
-            echo "sent_links.txt does not exist."
-            touch sent_links.txt
-          fi
+          touch state/sent_links.txt
+          touch state/sent_titles.txt
+          touch state/sent_hashes.txt
+          touch state/last_publish.txt
 
 
-          if [ ! -f sent_titles.txt ]; then
-            echo "sent_titles.txt does not exist."
-            touch sent_titles.txt
-          fi
+          # --------------------------------------
+          # SHOW STATE
+          # --------------------------------------
 
+          echo "State files after bot execution:"
 
-          if [ ! -f last_publish.txt ]; then
-            echo "last_publish.txt does not exist."
-            touch last_publish.txt
-          fi
+          ls -la state
+
+          echo ""
+          echo "Saved links:"
+          grep -cve '^[[:space:]]*$' state/sent_links.txt || true
+
+          echo "Saved titles:"
+          grep -cve '^[[:space:]]*$' state/sent_titles.txt || true
 
 
           # --------------------------------------
@@ -173,12 +147,10 @@ jobs:
 
 
           # --------------------------------------
-          # ADD STATE FILES
+          # ADD STATE
           # --------------------------------------
 
-          git add sent_links.txt
-          git add sent_titles.txt
-          git add last_publish.txt
+          git add state/
 
 
           # --------------------------------------
