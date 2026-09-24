@@ -1,1003 +1,345 @@
-# -*- coding: utf-8 -*-
+# ============================================================
+# JAHANTAB TELEGRAM NEWS BOT - STRICT FILTER V2.5
+# منابع داخلی ایران - خبرهای مهم و فوری
+# ============================================================
 
 import os
 import re
-import json
+import html
 import time
 import hashlib
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from difflib import SequenceMatcher
-from html import unescape
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse
 
-import requests
 import feedparser
+import requests
 from bs4 import BeautifulSoup
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
-# =========================================================
-# JAHANTAB TELEGRAM NEWS BOT
-# STRICT FILTER VERSION 2.2
-# =========================================================
+# ============================================================
+# CONFIG
+# ============================================================
 
-VERSION = "JAHANTAB TELEGRAM NEWS BOT - STRICT FILTER V2.2"
+VERSION = "JAHANTAB TELEGRAM NEWS BOT - STRICT FILTER V2.5"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "@jahantab_news").strip()
 
-# فقط یک خبر در هر اجرای GitHub
+BASE_DIR = Path(__file__).resolve().parent
+STATE_DIR = BASE_DIR / "state"
+
+SENT_LINKS_FILE = STATE_DIR / "sent_links.txt"
+SENT_HASHES_FILE = STATE_DIR / "sent_hashes.txt"
+SENT_TITLES_FILE = STATE_DIR / "sent_titles.txt"
+LAST_PUBLISH_FILE = STATE_DIR / "last_publish.txt"
+
+IMAGE_FILE = BASE_DIR / "news_original.jpg"
+FINAL_IMAGE_FILE = BASE_DIR / "final_news.jpg"
+
+LOGO_FILE = BASE_DIR / "jahantab_logo_transparent-1.png"
+FALLBACK_IMAGE = BASE_DIR / "fallback_news.jpg"
+
 MAX_POSTS_PER_RUN = 1
 
-# حداکثر خبر بررسی‌شده از هر منبع
-MAX_ITEMS_PER_SOURCE = 15
+# فاصله انتشار
+NORMAL_INTERVAL = 15 * 60
+MAJOR_INTERVAL = 10 * 60
 
 # حداکثر سن خبر
-MAX_AGE_HOURS = 12
-
-# حداقل امتیاز
-MIN_SCORE = 16
-
-# فاصله بین ارسال‌ها
-POST_DELAY = 2
-
-# فایل‌های ضدتکرار
-SENT_LINKS_FILE = "sent_links.txt"
-SENT_TITLES_FILE = "sent_titles.txt"
-
-# ثبت آخرین ارسال
-LAST_PUBLISH_FILE = "last_publish.txt"
+MAX_NEWS_AGE_HOURS = 12
 
 REQUEST_TIMEOUT = 20
 
 USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) "
-    "AppleWebKit/537.36 "
-    "(KHTML, like Gecko) "
-    "Chrome/131.0 Safari/537.36 "
-    "JAHANTAB-News-Bot/2.2"
+    "Mozilla/5.0 (Linux; Android 10) "
+    "AppleWebKit/537.36 Chrome/130 Safari/537.36 "
+    "JAHANTAB-NewsBot/2.5"
 )
 
-HEADERS = {
-    "User-Agent": USER_AGENT,
-    "Accept-Language": "fa-IR,fa;q=0.9,en;q=0.5",
-}
 
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+log = logging.getLogger("jahantab")
 
 
-# =========================================================
-# DATA STRUCTURES
-# =========================================================
+# ============================================================
+# SOURCE MODEL
+# ============================================================
 
-@dataclass
+@dataclass(frozen=True)
 class Source:
     name: str
     domain: str
-    url: str
+    homepage: str
+    priority: int = 1
 
 
-@dataclass
-class NewsItem:
-    title: str
-    url: str
-    source: str
-    domain: str
-
-    description: str = ""
-    image: str = ""
-    published: datetime | None = None
-
-    score: int = 0
-    event_score: int = 0
-    urgency_score: int = 0
-
-    is_major: bool = False
-    is_very_major: bool = False
-
-
-# =========================================================
-# SOURCES
-# =========================================================
+# ============================================================
+# فقط منابع داخلی ایران
+# ============================================================
 
 SOURCES = [
 
-    Source(
-        "تابناک",
-        "tabnak.ir",
-        "https://www.tabnak.ir/"
-    ),
+    # خبرگزاری‌ها / رسانه‌های ملی و سراسری
+    Source("ایرنا", "irna.ir", "https://www.irna.ir/", 5),
+    Source("ایسنا", "isna.ir", "https://www.isna.ir/", 5),
+    Source("فارس", "farsnews.ir", "https://www.farsnews.ir/", 5),
+    Source("تسنیم", "tasnimnews.com", "https://www.tasnimnews.com/fa", 5),
+    Source("مهر", "mehrnews.com", "https://www.mehrnews.com/", 5),
+    Source("ایلنا", "ilna.ir", "https://www.ilna.ir/", 5),
+    Source("صدا و سیما", "iribnews.ir", "https://www.iribnews.ir/", 5),
+    Source("باشگاه خبرنگاران جوان", "yjc.ir", "https://www.yjc.ir/", 4),
 
-    Source(
-        "فرارو",
-        "fararu.com",
-        "https://fararu.com/"
-    ),
-
-    Source(
-        "همشهری آنلاین",
-        "hamshahrionline.ir",
-        "https://www.hamshahrionline.ir/"
-    ),
-
-    Source(
-        "آخرین خبر",
-        "akharinkhabar.ir",
-        "https://akharinkhabar.ir/"
-    ),
-
-    Source(
-        "خبر فوری",
-        "khabarfoori.com",
-        "https://www.khabarfoori.com/"
-    ),
-
-    Source(
-        "خبرآنلاین",
-        "khabaronline.ir",
-        "https://www.khabaronline.ir/"
-    ),
-
-    Source(
-        "مهر",
-        "mehrnews.com",
-        "https://www.mehrnews.com/"
-    ),
-
-    Source(
-        "فارس",
-        "farsnews.ir",
-        "https://www.farsnews.ir/"
-    ),
-
-    Source(
-        "ایرنا",
-        "irna.ir",
-        "https://www.irna.ir/"
-    ),
-
-    Source(
-        "ایسنا",
-        "isna.ir",
-        "https://www.isna.ir/"
-    ),
-
-    Source(
-        "صدا و سیما",
-        "iribnews.ir",
-        "https://www.iribnews.ir/"
-    ),
-
-    Source(
-        "باشگاه خبرنگاران جوان",
-        "yjc.ir",
-        "https://www.yjc.ir/"
-    ),
-
-    Source(
-        "تسنیم",
-        "tasnimnews.com",
-        "https://www.tasnimnews.com/fa"
-    ),
-
-    Source(
-        "عصر ایران",
-        "asriran.com",
-        "https://www.asriran.com/"
-    ),
-
-    Source(
-        "مشرق نیوز",
-        "mashreghnews.ir",
-        "https://www.mashreghnews.ir/"
-    ),
-
-    Source(
-        "انتخاب",
-        "entekhab.ir",
-        "https://www.entekhab.ir/"
-    ),
-
-    Source(
-        "الف",
-        "alef.ir",
-        "https://www.alef.ir/"
-    ),
-
-    Source(
-        "ایلنا",
-        "ilna.ir",
-        "https://www.ilna.ir/"
-    ),
-
-    Source(
-        "روز پلاس",
-        "roozplus.com",
-        "https://www.roozplus.com/"
-    ),
+    # رسانه‌های داخلی منتخب
+    Source("تابناک", "tabnak.ir", "https://www.tabnak.ir/", 4),
+    Source("فرارو", "fararu.com", "https://fararu.com/", 4),
+    Source("همشهری آنلاین", "hamshahrionline.ir", "https://www.hamshahrionline.ir/", 4),
+    Source("آخرین خبر", "akharinkhabar.ir", "https://akharinkhabar.ir/", 4),
+    Source("خبر فوری", "khabarfoori.com", "https://www.khabarfoori.com/", 4),
+    Source("خبرآنلاین", "khabaronline.ir", "https://www.khabaronline.ir/", 4),
+    Source("عصر ایران", "asriran.com", "https://www.asriran.com/", 3),
+    Source("مشرق نیوز", "mashreghnews.ir", "https://www.mashreghnews.ir/", 3),
+    Source("انتخاب", "entekhab.ir", "https://www.entekhab.ir/", 3),
+    Source("الف", "alef.ir", "https://www.alef.ir/", 3),
+    Source("روز پلاس", "roozplus.com", "https://www.roozplus.com/", 3),
 ]
 
 
-TRUSTED_SOURCES = {
-    "ایرنا",
-    "ایسنا",
-    "فارس",
-    "تسنیم",
-    "مهر",
-    "صدا و سیما",
-    "ایلنا",
-}
+ALLOWED_DOMAINS = {s.domain.lower() for s in SOURCES}
 
 
-# =========================================================
-# DIRECT IMPORTANT TOPICS
-# =========================================================
+# ============================================================
+# SESSION
+# ============================================================
 
-IRAN_DIRECT = {
+session = requests.Session()
 
-    "ایران",
-    "جمهوری اسلامی ایران",
+retry = Retry(
+    total=3,
+    connect=3,
+    read=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
+)
 
-    "حمله به ایران",
-    "حمله آمریکا به ایران",
-    "حمله اسرائیل به ایران",
+adapter = HTTPAdapter(max_retries=retry)
 
-    "حمله ایران به آمریکا",
-    "حمله ایران به اسرائیل",
+session.mount("http://", adapter)
+session.mount("https://", adapter)
 
-    "حمله موشکی به ایران",
-    "حمله هوایی به ایران",
+session.headers.update({
+    "User-Agent": USER_AGENT,
+    "Accept-Language": "fa-IR,fa;q=0.9,en;q=0.5",
+})
 
-    "پاسخ ایران",
-    "پاسخ موشکی ایران",
 
-    "عملیات ایران",
-    "عملیات علیه ایران",
+# ============================================================
+# STATE
+# ============================================================
 
-    "درگیری ایران و آمریکا",
-    "درگیری ایران و اسرائیل",
+def ensure_state_dir():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-    "جنگ ایران و آمریکا",
-    "جنگ ایران و اسرائیل",
 
-    "نیروهای آمریکایی در ایران",
+def normalize_text(text: str) -> str:
+    text = html.unescape(text or "")
+    text = text.replace("\u200c", " ")
+    text = text.replace("\u200f", " ")
+    text = text.replace("\u202a", " ")
+    text = text.replace("\u202b", " ")
+    text = text.replace("\u202c", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
-    "پایگاه آمریکایی",
-    "پایگاه آمریکا",
 
-    "سنتکام",
-    "پنتاگون",
-    "نیروهای آمریکایی",
-
-    "تأسیسات هسته‌ای ایران",
-    "تاسیسات هسته‌ای ایران",
-
-    "برنامه هسته‌ای ایران",
-
-    "حمله به تأسیسات هسته‌ای",
-    "حمله به تاسیسات هسته‌ای",
-
-    "تحریم آمریکا علیه ایران",
-}
-
-
-# =========================================================
-# NEW:
-# IMPORTANT IRAN POLITICAL / DIPLOMATIC EVENTS
-# =========================================================
-
-IRAN_DIPLOMATIC_TERMS = {
-
-    "مجمع عمومی سازمان ملل",
-    "مجمع عمومی سازمان ملل متحد",
-    "سازمان ملل",
-    "سازمان ملل متحد",
-
-    "نشست سازمان ملل",
-    "نشست مجمع عمومی",
-
-    "شورای امنیت",
-    "شورای امنیت سازمان ملل",
-
-    "قطعنامه شورای امنیت",
-
-    "سخنرانی ترامپ",
-    "ترامپ در سازمان ملل",
-    "ترامپ در مجمع عمومی",
-
-    "دونالد ترامپ",
-    "ترامپ",
-
-    "رئیس جمهور آمریکا",
-    "رئیس‌جمهور آمریکا",
-
-    "کاخ سفید",
-
-    "وزیر خارجه آمریکا",
-
-    "مذاکرات ایران و آمریکا",
-    "مذاکره ایران و آمریکا",
-
-    "مذاکرات ایران",
-    "مذاکره با ایران",
-
-    "ایران و آمریکا",
-
-    "ایران در سازمان ملل",
-    "ایران در مجمع عمومی",
-
-    "ایران و سازمان ملل",
-
-    "برجام",
-    "پرونده هسته‌ای ایران",
-}
-
-
-# =========================================================
-# HIGH PRIORITY COMBINATIONS
-# =========================================================
-
-IRAN_DIPLOMATIC_COMBINATIONS = {
-
-    (
-        "ترامپ",
-        "ایران",
-    ),
-
-    (
-        "ترامپ",
-        "سازمان ملل",
-    ),
-
-    (
-        "ترامپ",
-        "مجمع عمومی",
-    ),
-
-    (
-        "رئیس جمهور آمریکا",
-        "ایران",
-    ),
-
-    (
-        "رئیس‌جمهور آمریکا",
-        "ایران",
-    ),
-
-    (
-        "سازمان ملل",
-        "ایران",
-    ),
-
-    (
-        "مجمع عمومی",
-        "ایران",
-    ),
-
-    (
-        "شورای امنیت",
-        "ایران",
-    ),
-
-    (
-        "کاخ سفید",
-        "ایران",
-    ),
-
-    (
-        "مذاکره",
-        "ایران",
-    ),
-
-    (
-        "تحریم",
-        "ایران",
-    ),
-
-    (
-        "هسته‌ای",
-        "ایران",
-    ),
-}
-
-
-# =========================================================
-# ISRAEL / REGION
-# =========================================================
-
-ISRAEL_REGION_DIRECT = {
-
-    "حمله اسرائیل",
-    "حمله به اسرائیل",
-
-    "حمله ایران به اسرائیل",
-    "حمله اسرائیل به ایران",
-
-    "درگیری اسرائیل",
-    "جنگ اسرائیل",
-    "عملیات اسرائیل",
-
-    "ارتش اسرائیل",
-
-    "حمله اسرائیل به غزه",
-    "حمله اسرائیل به لبنان",
-}
-
-
-# =========================================================
-# RESISTANCE
-# =========================================================
-
-RESISTANCE_DIRECT = {
-
-    "حزب‌الله",
-    "حزب الله",
-
-    "حمله حزب‌الله",
-    "حمله حزب الله",
-
-    "عملیات حزب‌الله",
-    "عملیات حزب الله",
-
-    "حماس",
-
-    "حمله حماس",
-    "عملیات حماس",
-
-    "جنگ غزه",
-    "حمله به غزه",
-    "حمله به لبنان",
-
-    "انصارالله",
-    "انصار الله",
-
-    "حوثی‌ها",
-    "حوثی ها",
-
-    "حمله حوثی‌ها",
-    "حمله حوثی ها",
-
-    "عملیات انصارالله",
-    "عملیات انصار الله",
-
-    "حشدالشعبی",
-    "حشد الشعبی",
-
-    "عملیات حشدالشعبی",
-}
-
-
-# =========================================================
-# MARITIME
-# =========================================================
-
-MARITIME_DIRECT = {
-
-    "تنگه هرمز",
-
-    "بستن تنگه هرمز",
-    "انسداد تنگه هرمز",
-    "بازگشایی تنگه هرمز",
-
-    "خلیج فارس",
-
-    "حمله در خلیج فارس",
-    "درگیری در خلیج فارس",
-
-    "نفتکش",
-    "نفت‌کش",
-
-    "توقیف نفتکش",
-    "توقیف نفت‌کش",
-
-    "حمله به نفتکش",
-    "حمله به نفت‌کش",
-
-    "کشتیرانی در خلیج فارس",
-
-    "باب‌المندب",
-    "باب المندب",
-
-    "حمله در دریای سرخ",
-    "کشتیرانی دریای سرخ",
-}
-
-
-# =========================================================
-# MAJOR EVENT TERMS
-# =========================================================
-
-MAJOR_EVENT_TERMS = {
-
-    "حمله": 5,
-    "حمله موشکی": 8,
-    "حمله هوایی": 7,
-
-    "انفجار": 7,
-    "انفجار بزرگ": 10,
-
-    "عملیات نظامی": 8,
-    "عملیات": 4,
-
-    "شلیک موشک": 8,
-    "پاسخ نظامی": 8,
-
-    "آتش‌بس": 7,
-    "آتش بس": 7,
-
-    "اعلام جنگ": 12,
-    "آغاز جنگ": 12,
-    "پایان جنگ": 10,
-
-    "ترور": 8,
-
-    "کشته": 4,
-    "کشته شدند": 6,
-
-    "تلفات": 5,
-
-    "مجروح": 4,
-    "مجروح شدند": 5,
-
-    "رهگیری": 6,
-    "انهدام": 6,
-    "سقوط": 4,
-
-    "توقیف": 6,
-    "اسارت": 6,
-
-    "اولتیماتوم": 6,
-
-    # رویدادهای سیاسی مهم
-    "تصمیم": 4,
-    "تصویب": 5,
-    "قطعنامه": 6,
-    "تحریم": 5,
-    "هشدار": 4,
-    "تهدید": 5,
-}
-
-
-# =========================================================
-# LOCAL INCIDENTS
-# =========================================================
-
-ACCIDENT_TERMS = {
-
-    "تصادف",
-    "سانحه رانندگی",
-    "حادثه رانندگی",
-    "واژگونی",
-
-    "غرق شد",
-    "غرق شدند",
-    "غرق شدن",
-
-    "آتش‌سوزی",
-    "آتش سوزی",
-
-    "انفجار",
-
-    "ریزش ساختمان",
-    "ریزش آوار",
-    "فروریختن ساختمان",
-
-    "سیل",
-    "زلزله",
-    "رانش زمین",
-
-    "معدن",
-    "حادثه معدن",
-}
-
-
-SEVERE_ACCIDENT_TERMS = {
-
-    "کشته",
-    "کشته شدند",
-    "جان باخت",
-    "جان باختند",
-    "فوت",
-    "تلفات",
-
-    "مصدوم",
-    "مصدومان",
-
-    "مجروح",
-    "مجروحان",
-
-    "نجات",
-    "عملیات امداد",
-
-    "مفقود",
-    "مفقودان",
-
-    "خسارت سنگین",
-    "خسارت گسترده",
-    "خسارات سنگین",
-}
-
-
-# =========================================================
-# EXCLUSIONS
-# =========================================================
-
-EXCLUDE_TERMS = {
-
-    "فوتبال",
-    "لیگ برتر",
-    "استقلال",
-    "پرسپولیس",
-    "ورزشی",
-
-    "سینما",
-    "بازیگر",
-    "فیلم",
-    "موسیقی",
-    "کنسرت",
-
-    "پزشکی",
-    "سلامت",
-    "بیمارستان",
-
-    "دانشگاه",
-    "دانشجو",
-
-    "مدرسه",
-    "مدارس",
-    "آموزش",
-    "تعطیلی مدارس",
-    "مجازی شد",
-    "غیرحضوری",
-
-    "هواشناسی",
-    "آب و هوا",
-
-    "بورس",
-    "قیمت دلار",
-    "قیمت طلا",
-
-    "خودرو",
-    "مسکن",
-
-    "گردشگری",
-    "تکنولوژی",
-    "اینترنت",
-
-    "فال",
-    "آشپزی",
-    "سبک زندگی",
-
-    "چهره",
-    "سلبریتی",
-}
-
-
-# =========================================================
-# ANALYSIS / COMMENTARY
-# =========================================================
-
-ANALYSIS_TERMS = {
-
-    "تحلیل",
-    "یادداشت",
-    "گفتگو",
-    "گفت‌وگو",
-    "بررسی",
-    "سناریو",
-    "پیش‌بینی",
-    "آینده جنگ",
-    "پرونده",
-}
-
-
-# =========================================================
-# TEXT FUNCTIONS
-# =========================================================
-
-def normalize_text(text: str):
-
-    if not text:
-        return ""
-
-    text = unescape(str(text))
+def normalize_title(text: str) -> str:
+    text = normalize_text(text).lower()
 
     replacements = {
-
         "ي": "ی",
-        "ى": "ی",
         "ك": "ک",
-
         "ۀ": "ه",
         "ة": "ه",
-
         "ؤ": "و",
         "إ": "ا",
         "أ": "ا",
-
-        "\u200c": " ",
-        "\u200f": " ",
-        "\u200e": " ",
+        "ٱ": "ا",
     }
 
     for old, new in replacements.items():
         text = text.replace(old, new)
 
-    text = re.sub(
-        r"<[^>]+>",
-        " ",
-        text
-    )
-
-    text = re.sub(
-        r"https?://\S+",
-        " ",
-        text
-    )
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
+    text = re.sub(r"[^\w\sآ-ی]", " ", text)
+    text = re.sub(r"\s+", " ", text)
 
     return text.strip()
 
 
-def clean_title(title: str):
-
-    title = normalize_text(title)
-
-    title = re.sub(
-        r"^(خبر فوری|فوری|اختصاصی|لحظه به لحظه)"
-        r"\s*[:：\-–—]*\s*",
-        "",
-        title,
-        flags=re.IGNORECASE,
-    )
-
-    return title.strip()
-
-
-def words(text: str):
-
-    return {
-        word
-        for word in re.findall(
-            r"[\w\u0600-\u06FF]+",
-            normalize_text(text).lower()
-        )
-        if len(word) >= 2
-    }
-
-
-def similarity(a: str, b: str):
-
-    return SequenceMatcher(
-        None,
-        normalize_text(a),
-        normalize_text(b)
-    ).ratio()
-
-
-def jaccard(a: str, b: str):
-
-    a_words = words(a)
-    b_words = words(b)
-
-    if not a_words or not b_words:
-        return 0.0
-
-    return (
-        len(a_words & b_words)
-        / len(a_words | b_words)
-    )
-
-
-def shorten(text: str, limit: int):
-
-    text = normalize_text(text)
-
-    if len(text) <= limit:
-        return text
-
-    text = text[:limit]
-
-    if " " in text:
-        text = text.rsplit(
-            " ",
-            1
-        )[0]
-
-    return text.rstrip(
-        "،؛,:- "
-    ) + "..."
-
-
-def escape_html(text: str):
-
-    return (
-        str(text)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-
-
-def contains_any(text, terms):
-
-    return any(
-        term in text
-        for term in terms
-    )
-
-
-# =========================================================
-# FILE HELPERS
-# =========================================================
-
-def load_lines(filename):
-
-    if not os.path.exists(filename):
+def read_lines(path: Path):
+    if not path.exists():
         return set()
 
     try:
-        with open(
-            filename,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            return {
-                line.strip()
-                for line in f
-                if line.strip()
-            }
-
-    except Exception as exc:
-
-        print(
-            f"LOAD ERROR {filename}: {exc}"
-        )
-
+        return {
+            normalize_text(x)
+            for x in path.read_text(encoding="utf-8").splitlines()
+            if normalize_text(x)
+        }
+    except Exception as e:
+        log.warning("STATE READ ERROR %s: %s", path, e)
         return set()
 
 
-def append_line(filename, value):
+def write_lines(path: Path, values):
+    ensure_state_dir()
 
     try:
+        ordered = list(values)
+        path.write_text(
+            "\n".join(ordered) + ("\n" if ordered else ""),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log.error("STATE WRITE ERROR %s: %s", path, e)
 
-        with open(
-            filename,
-            "a",
-            encoding="utf-8"
-        ) as f:
 
-            f.write(
-                str(value).strip()
-                + "\n"
+def migrate_old_state():
+    """
+    برای سازگاری با نسخه‌های قدیمی.
+    اگر فایل‌های قدیمی در ریشه پروژه وجود داشته باشند،
+    اطلاعات آنها به state/ منتقل می‌شود.
+    """
+
+    ensure_state_dir()
+
+    migrations = [
+        ("sent_links.txt", SENT_LINKS_FILE),
+        ("sent_hashes.txt", SENT_HASHES_FILE),
+        ("sent_titles.txt", SENT_TITLES_FILE),
+        ("last_publish.txt", LAST_PUBLISH_FILE),
+    ]
+
+    for old_name, new_path in migrations:
+        old_path = BASE_DIR / old_name
+
+        if old_path.exists() and not new_path.exists():
+            try:
+                new_path.write_text(
+                    old_path.read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+
+                log.info(
+                    "Migrated old state: %s -> %s",
+                    old_path.name,
+                    new_path,
+                )
+
+            except Exception as e:
+                log.warning("Migration failed %s: %s", old_path, e)
+
+
+class StateStore:
+
+    def __init__(self):
+        ensure_state_dir()
+        migrate_old_state()
+
+        self.sent_links = read_lines(SENT_LINKS_FILE)
+        self.sent_hashes = read_lines(SENT_HASHES_FILE)
+        self.sent_titles = read_lines(SENT_TITLES_FILE)
+
+        self.last_publish = self._read_last_publish()
+
+        log.info(
+            "STATE | links=%d titles=%d hashes=%d",
+            len(self.sent_links),
+            len(self.sent_titles),
+            len(self.sent_hashes),
+        )
+
+    def _read_last_publish(self):
+        if not LAST_PUBLISH_FILE.exists():
+            return 0
+
+        try:
+            return float(
+                LAST_PUBLISH_FILE.read_text(
+                    encoding="utf-8"
+                ).strip()
             )
+        except Exception:
+            return 0
 
-    except Exception as exc:
-
-        print(
-            f"SAVE ERROR {filename}: {exc}"
+    def save(self):
+        write_lines(
+            SENT_LINKS_FILE,
+            sorted(self.sent_links),
         )
 
-
-def title_fingerprint(title):
-
-    normalized = clean_title(title).lower()
-
-    return hashlib.sha1(
-        normalized.encode(
-            "utf-8"
+        write_lines(
+            SENT_HASHES_FILE,
+            sorted(self.sent_hashes),
         )
-    ).hexdigest()
+
+        write_lines(
+            SENT_TITLES_FILE,
+            sorted(self.sent_titles),
+        )
+
+        LAST_PUBLISH_FILE.write_text(
+            str(self.last_publish),
+            encoding="utf-8",
+        )
+
+    def mark_sent(self, link, title):
+        link = normalize_text(link)
+        title = normalize_title(title)
+
+        if link:
+            self.sent_links.add(link)
+
+        if title:
+            self.sent_titles.add(title)
+
+        self.sent_hashes.add(
+            hashlib.sha256(
+                title.encode("utf-8")
+            ).hexdigest()
+        )
+
+        self.last_publish = time.time()
+
+        self.save()
 
 
-# =========================================================
-# URL
-# =========================================================
+# ============================================================
+# SOURCE HELPERS
+# ============================================================
 
-def canonical_url(url: str):
-
-    if not url:
-        return ""
-
+def get_source_for_url(url: str):
     try:
+        host = urlparse(url).netloc.lower()
+        host = host.split(":")[0]
 
-        parsed = urlparse(url)
-
-        scheme = parsed.scheme.lower()
-
-        netloc = parsed.netloc.lower()
-
-        if netloc.startswith("www."):
-            netloc = netloc[4:]
-
-        path = re.sub(
-            r"/+",
-            "/",
-            parsed.path
-        )
-
-        if (
-            path != "/"
-            and path.endswith("/")
-        ):
-            path = path[:-1]
-
-        return urlunparse(
-            (
-                scheme,
-                netloc,
-                path,
-                "",
-                "",
-                "",
-            )
-        )
-
-    except Exception:
-
-        return url.strip()
-
-
-def same_domain(
-    url: str,
-    domain: str
-):
-
-    try:
-
-        host = urlparse(
-            url
-        ).netloc.lower()
-
-        if host.startswith("www."):
-            host = host[4:]
-
-        return (
-            host == domain
-            or host.endswith(
-                "." + domain
-            )
-        )
-
-    except Exception:
-
-        return False
-
-
-# =========================================================
-# DATE
-# =========================================================
-
-def parse_datetime(value):
-
-    if not value:
-        return None
-
-    try:
-
-        if hasattr(
-            value,
-            "tm_year"
-        ):
-
-            return datetime(
-                value.tm_year,
-                value.tm_mon,
-                value.tm_mday,
-                value.tm_hour,
-                value.tm_min,
-                value.tm_sec,
-                tzinfo=timezone.utc,
-            )
+        for source in SOURCES:
+            if host == source.domain or host.endswith("." + source.domain):
+                return source
 
     except Exception:
         pass
@@ -1005,57 +347,13 @@ def parse_datetime(value):
     return None
 
 
-def age_hours(dt):
-
-    if not dt:
-        return 999999
-
-    if dt.tzinfo is None:
-        dt = dt.replace(
-            tzinfo=timezone.utc
-        )
-
-    return max(
-        0,
-        (
-            datetime.now(timezone.utc)
-            - dt
-        ).total_seconds()
-        / 3600
-    )
+def is_allowed_url(url: str):
+    return get_source_for_url(url) is not None
 
 
-# =========================================================
-# HTTP
-# =========================================================
-
-def get_url(url: str):
-
-    try:
-
-        response = SESSION.get(
-            url,
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=True,
-        )
-
-        if response.status_code >= 400:
-            return None
-
-        return response
-
-    except Exception as exc:
-
-        print(
-            f"REQUEST ERROR: {url} -> {exc}"
-        )
-
-        return None
-
-
-# =========================================================
+# ============================================================
 # RSS DISCOVERY
-# =========================================================
+# ============================================================
 
 FEED_PATHS = [
     "/rss",
@@ -1063,56 +361,43 @@ FEED_PATHS = [
     "/feed",
     "/feed.xml",
     "/fa/rss",
+    "/fa/rss.xml",
+    "/news/rss",
 ]
 
 
-def discover_feeds(
-    source: Source
-):
+def discover_feeds(source: Source):
 
-    found = []
+    candidates = []
 
-    for path in FEED_PATHS:
-
-        found.append(
-            urljoin(
-                source.url,
-                path
-            )
+    try:
+        r = session.get(
+            source.homepage,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True,
         )
 
-    response = get_url(
-        source.url
-    )
-
-    if response:
-
-        try:
-
+        if r.ok:
             soup = BeautifulSoup(
-                response.text,
-                "html.parser"
+                r.text,
+                "html.parser",
             )
 
             for link in soup.find_all(
                 "link",
-                href=True
+                href=True,
             ):
 
                 rel = " ".join(
-                    link.get(
-                        "rel",
-                        []
-                    )
+                    link.get("rel", [])
                 ).lower()
 
                 typ = (
-                    link.get(
-                        "type",
-                        ""
-                    )
+                    link.get("type", "")
                     .lower()
                 )
+
+                href = link.get("href")
 
                 if (
                     "alternate" in rel
@@ -1122,1642 +407,916 @@ def discover_feeds(
                         or "xml" in typ
                     )
                 ):
-
-                    found.insert(
-                        0,
-                        urljoin(
-                            source.url,
-                            link["href"]
-                        )
+                    full = urljoin(
+                        r.url,
+                        href,
                     )
 
-        except Exception:
-            pass
+                    if is_allowed_url(full):
+                        candidates.append(full)
 
+    except Exception as e:
+        log.debug(
+            "RSS LINK DISCOVERY FAILED %s: %s",
+            source.name,
+            e,
+        )
+
+    for path in FEED_PATHS:
+        candidates.append(
+            urljoin(
+                source.homepage,
+                path,
+            )
+        )
+
+    # حذف تکراری‌ها
     result = []
 
-    for url in found:
+    seen = set()
 
-        url = canonical_url(url)
+    for url in candidates:
 
-        if (
-            url
-            and url not in result
-        ):
-
-            result.append(url)
-
-    return result[:8]
-
-
-# =========================================================
-# RSS PARSER
-# =========================================================
-
-def parse_feed(
-    feed_url: str,
-    source: Source
-):
-
-    response = get_url(
-        feed_url
-    )
-
-    if not response:
-        return []
-
-    try:
-
-        parsed = feedparser.parse(
-            response.content
-        )
-
-    except Exception:
-
-        return []
-
-    result = []
-
-    for entry in parsed.entries[
-        :MAX_ITEMS_PER_SOURCE
-    ]:
-
-        title = clean_title(
-            entry.get(
-                "title",
-                ""
-            )
-        )
-
-        url = canonical_url(
-            entry.get(
-                "link",
-                ""
-            )
-        )
-
-        if not title or not url:
+        if url in seen:
             continue
 
-        if not same_domain(
-            url,
-            source.domain
-        ):
-            continue
-
-        description = normalize_text(
-            entry.get(
-                "summary",
-                ""
-            )
-            or entry.get(
-                "description",
-                ""
-            )
-            or ""
-        )
-
-        published = (
-            parse_datetime(
-                entry.get(
-                    "published_parsed"
-                )
-            )
-            or parse_datetime(
-                entry.get(
-                    "updated_parsed"
-                )
-            )
-        )
-
-        image = ""
-
-        for media in entry.get(
-            "media_content",
-            []
-        ):
-
-            candidate = (
-                media.get("url")
-                or media.get("href")
-            )
-
-            if candidate:
-
-                image = urljoin(
-                    url,
-                    candidate
-                )
-
-                break
-
-        if not image:
-
-            thumbnails = entry.get(
-                "media_thumbnail",
-                []
-            )
-
-            if thumbnails:
-
-                image = thumbnails[
-                    0
-                ].get(
-                    "url",
-                    ""
-                )
-
-        result.append(
-            NewsItem(
-                title=title,
-                url=url,
-                source=source.name,
-                domain=source.domain,
-                description=description,
-                image=image,
-                published=published,
-            )
-        )
+        seen.add(url)
+        result.append(url)
 
     return result
 
 
-# =========================================================
-# ARTICLE DATA
-# =========================================================
+# ============================================================
+# ARTICLE MODEL
+# ============================================================
 
-def extract_article_data(
-    item: NewsItem
-):
+@dataclass
+class Article:
+    title: str
+    link: str
+    description: str
+    source: Source
+    published: float
+    image_url: str = ""
+    score: float = 0
+    major: bool = False
 
-    response = get_url(
-        item.url
+
+# ============================================================
+# TIME
+# ============================================================
+
+def entry_timestamp(entry):
+
+    for key in (
+        "published_parsed",
+        "updated_parsed",
+        "created_parsed",
+    ):
+
+        value = entry.get(key)
+
+        if value:
+            try:
+                return time.mktime(value)
+            except Exception:
+                pass
+
+    return 0
+
+
+def age_hours(timestamp):
+
+    if not timestamp:
+        return 999999
+
+    return max(
+        0,
+        (
+            time.time() - timestamp
+        ) / 3600,
     )
 
-    if not response:
-        return item
+
+# ============================================================
+# TEXT EXTRACTION
+# ============================================================
+
+def strip_html(text):
+
+    soup = BeautifulSoup(
+        text or "",
+        "html.parser",
+    )
+
+    return normalize_text(
+        html.unescape(
+            soup.get_text(" ")
+        )
+    )
+
+
+def extract_image_from_entry(entry):
+
+    candidates = []
+
+    for key in (
+        "media_content",
+        "media_thumbnail",
+    ):
+
+        items = entry.get(key, [])
+
+        if isinstance(items, dict):
+            items = [items]
+
+        for item in items:
+
+            if isinstance(item, dict):
+
+                url = (
+                    item.get("url")
+                    or item.get("href")
+                )
+
+                if url:
+                    candidates.append(url)
+
+    for enclosure in entry.get(
+        "enclosures",
+        [],
+    ):
+
+        if isinstance(enclosure, dict):
+
+            url = (
+                enclosure.get("href")
+                or enclosure.get("url")
+            )
+
+            if url:
+                candidates.append(url)
+
+    description = entry.get(
+        "summary",
+        "",
+    )
+
+    soup = BeautifulSoup(
+        description,
+        "html.parser",
+    )
+
+    img = soup.find("img")
+
+    if img and img.get("src"):
+        candidates.append(
+            img.get("src")
+        )
+
+    for url in candidates:
+
+        if url and url.startswith(("http://", "https://")):
+            return url
+
+    return ""
+
+
+# ============================================================
+# ARTICLE PAGE EXTRACTION
+# ============================================================
+
+def extract_article_data(article: Article):
 
     try:
 
+        r = session.get(
+            article.link,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True,
+        )
+
+        if not r.ok:
+            return article
+
         soup = BeautifulSoup(
-            response.text,
-            "html.parser"
+            r.text,
+            "html.parser",
         )
 
-        # OpenGraph image
-        if not item.image:
-
-            meta = soup.find(
-                "meta",
-                property="og:image"
-            )
-
-            if (
-                meta
-                and meta.get("content")
-            ):
-
-                item.image = urljoin(
-                    item.url,
-                    meta["content"]
-                )
-
-        # Twitter image
-        if not item.image:
-
-            meta = soup.find(
-                "meta",
-                attrs={
-                    "name": "twitter:image"
-                }
-            )
-
-            if (
-                meta
-                and meta.get("content")
-            ):
-
-                item.image = urljoin(
-                    item.url,
-                    meta["content"]
-                )
-
+        # ----------------------------------------------------
         # Description
-        if not item.description:
+        # ----------------------------------------------------
 
-            meta = soup.find(
-                "meta",
-                attrs={
-                    "name": "description"
-                }
+        paragraphs = []
+
+        for p in soup.find_all("p"):
+
+            txt = normalize_text(
+                p.get_text(" ")
             )
 
             if (
-                meta
-                and meta.get("content")
+                len(txt) >= 30
+                and txt not in paragraphs
             ):
+                paragraphs.append(txt)
 
-                item.description = normalize_text(
-                    meta["content"]
+            if len(paragraphs) >= 8:
+                break
+
+        if paragraphs:
+
+            article.description = " ".join(
+                paragraphs
+            )
+
+        # ----------------------------------------------------
+        # Image
+        # ----------------------------------------------------
+
+        if not article.image_url:
+
+            meta_candidates = [
+                (
+                    "property",
+                    "og:image",
+                ),
+                (
+                    "name",
+                    "twitter:image",
+                ),
+            ]
+
+            for attr, value in meta_candidates:
+
+                tag = soup.find(
+                    "meta",
+                    attrs={
+                        attr: value
+                    },
                 )
 
-        # Published time
-        if not item.published:
+                if tag and tag.get("content"):
 
-            meta = soup.find(
-                "meta",
-                property="article:published_time"
-            )
-
-            if (
-                meta
-                and meta.get("content")
-            ):
-
-                try:
-
-                    value = (
-                        meta["content"]
-                        .replace(
-                            "Z",
-                            "+00:00"
-                        )
+                    candidate = urljoin(
+                        article.link,
+                        tag["content"],
                     )
 
-                    dt = datetime.fromisoformat(
-                        value
-                    )
+                    if candidate.startswith(
+                        ("http://", "https://")
+                    ):
+                        article.image_url = candidate
+                        break
 
-                    if dt.tzinfo is None:
-                        dt = dt.replace(
-                            tzinfo=timezone.utc
-                        )
+        return article
 
-                    item.published = dt
+    except Exception as e:
 
-                except Exception:
-                    pass
-
-    except Exception as exc:
-
-        print(
-            f"ARTICLE ERROR: "
-            f"{item.url} -> {exc}"
+        log.debug(
+            "ARTICLE EXTRACTION ERROR %s: %s",
+            article.link,
+            e,
         )
 
-    return item
+        return article
 
 
-# =========================================================
-# EARTHQUAKE
-# =========================================================
+# ============================================================
+# WORD MATCHING
+# ============================================================
 
-EARTHQUAKE_PATTERNS = [
+def contains_word(text: str, word: str):
 
-    r"زلزله[^.]{0,100}"
-    r"([6-9](?:\.\d+)?)\s*"
-    r"(?:ریشتر|درجه)",
+    text = normalize_title(text)
+    word = normalize_title(word)
 
-    r"([6-9](?:\.\d+)?)\s*"
-    r"(?:ریشتر|درجه)"
-    r"[^.\n]{0,40}"
-    r"زلزله",
+    if not word:
+        return False
 
-    r"زلزله[^.]{0,100}"
-    r"مقیاس\s*"
-    r"([6-9](?:\.\d+)?)",
+    return re.search(
+        rf"(?<!\w){re.escape(word)}(?!\w)",
+        text,
+    ) is not None
+
+
+def any_word(text, words):
+
+    return any(
+        contains_word(text, word)
+        for word in words
+    )
+
+
+def has_combo(text, a, b):
+
+    return (
+        contains_word(text, a)
+        and contains_word(text, b)
+    )
+
+
+# ============================================================
+# NEWS FILTER
+# ============================================================
+
+# موضوعات مهم داخلی / منطقه‌ای
+DIRECT_TOPICS = [
+    "جنگ",
+    "حمله",
+    "موشک",
+    "موشکی",
+    "پهپاد",
+    "انفجار",
+    "ترور",
+    "حمله هوایی",
+    "حمله موشکی",
+    "حمله پهپادی",
+
+    "تحریم",
+    "تحریم‌های جدید",
+    "تحریم جدید",
+
+    "مذاکره",
+    "مذاکرات",
+    "مذاکرات ایران و آمریکا",
+
+    "برجام",
+    "پرونده هسته‌ای",
+    "هسته‌ای",
+
+    "آژانس بین‌المللی انرژی اتمی",
+    "شورای امنیت",
+    "سازمان ملل",
+
+    "تنگه هرمز",
+    "هرمز",
+    "خلیج فارس",
+
+    "حزب الله",
+    "حزب‌الله",
+    "لبنان",
+
+    "حماس",
+    "غزه",
+    "فلسطین",
+
+    "انصارالله",
+    "انصار الله",
+    "حوثی",
+    "حوثی‌ها",
+    "یمن",
+
+    "آمریکا",
+    "ترامپ",
+    "اسرائیل",
+    "رژیم صهیونیستی",
+
+    "زلزله",
+    "سیل",
+    "آتش سوزی",
+    "آتش‌سوزی",
+
+    "هواپیما",
+    "قطار",
+    "اتوبوس",
+    "تصادف",
+    "سقوط",
 ]
 
 
-def earthquake_magnitude(text):
+URGENT_WORDS = [
+    "فوری",
+    "خبر فوری",
+    "لحظه‌ای",
+    "لحظه ای",
+    "آنی",
+    "مهم",
+    "اضطراری",
+    "هشدار",
+    "هشدار فوری",
+    "اعلام شد",
+    "تایید شد",
+    "تأیید شد",
+]
 
-    text = normalize_text(text)
 
-    for pattern in EARTHQUAKE_PATTERNS:
+MAJOR_WORDS = [
+    "حمله",
+    "حمله موشکی",
+    "حمله هوایی",
+    "حمله پهپادی",
+    "جنگ",
+    "انفجار",
+    "ترور",
+    "موشک",
+    "موشکی",
+    "تنگه هرمز",
+    "آژانس بین‌المللی انرژی اتمی",
+    "شورای امنیت",
+    "زلزله",
+    "سقوط هواپیما",
+]
 
-        match = re.search(
-            pattern,
-            text,
-            flags=re.IGNORECASE
+
+IRAN_COMBO_TERMS = [
+    "ایران",
+    "ایرانی",
+    "تهران",
+]
+
+
+REGIONAL_COMBOS = [
+    ("ایران", "آمریکا"),
+    ("ایران", "ترامپ"),
+    ("ایران", "اسرائیل"),
+    ("ایران", "حمله"),
+    ("ایران", "جنگ"),
+    ("ایران", "موشک"),
+    ("ایران", "موشکی"),
+    ("ایران", "انفجار"),
+    ("ایران", "ترور"),
+    ("ایران", "تحریم"),
+    ("ایران", "مذاکره"),
+    ("ایران", "هسته‌ای"),
+    ("ایران", "آژانس"),
+    ("ایران", "شورای امنیت"),
+
+    ("حزب‌الله", "لبنان"),
+    ("حزب الله", "لبنان"),
+
+    ("انصارالله", "یمن"),
+    ("انصار الله", "یمن"),
+    ("حوثی", "یمن"),
+
+    ("حماس", "غزه"),
+    ("فلسطین", "غزه"),
+
+    ("تنگه", "هرمز"),
+    ("خلیج فارس", "ایران"),
+]
+
+
+ACCIDENT_WORDS = [
+    "سقوط",
+    "واژگونی",
+    "تصادف",
+    "انفجار",
+    "آتش‌سوزی",
+    "آتش سوزی",
+    "حادثه",
+    "فوت",
+    "کشته",
+    "مصدوم",
+]
+
+
+def score_article(article: Article):
+
+    title = normalize_text(article.title)
+    desc = normalize_text(article.description)
+
+    full = f"{title} {desc}"
+
+    score = 0
+    major = False
+
+    # --------------------------------------------------------
+    # عنوان مهم‌تر از متن
+    # --------------------------------------------------------
+
+    for word in DIRECT_TOPICS:
+
+        if contains_word(title, word):
+            score += 4
+
+        elif contains_word(desc, word):
+            score += 1
+
+    # --------------------------------------------------------
+    # خبر فوری
+    # --------------------------------------------------------
+
+    for word in URGENT_WORDS:
+
+        if contains_word(title, word):
+            score += 5
+
+    # --------------------------------------------------------
+    # رویدادهای بسیار مهم
+    # --------------------------------------------------------
+
+    for word in MAJOR_WORDS:
+
+        if contains_word(title, word):
+            score += 5
+            major = True
+
+    # --------------------------------------------------------
+    # ترکیب‌های مهم
+    # --------------------------------------------------------
+
+    for a, b in REGIONAL_COMBOS:
+
+        if has_combo(title, a, b):
+
+            score += 8
+            major = True
+
+        elif has_combo(full, a, b):
+
+            score += 3
+
+    # --------------------------------------------------------
+    # زلزله
+    # --------------------------------------------------------
+
+    if contains_word(full, "زلزله"):
+
+        magnitude = re.search(
+            r"(?:بزرگی|قدرت|با بزرگای?)\s*(?:حدود\s*)?(\d+(?:[.,]\d+)?)",
+            full,
         )
 
-        if match:
+        if magnitude:
 
             try:
-
-                return float(
-                    match.group(1)
+                mag = float(
+                    magnitude.group(1)
+                    .replace(",", ".")
                 )
+
+                if mag >= 6:
+                    score += 12
+                    major = True
+
+                elif mag >= 5:
+                    score += 7
 
             except Exception:
                 pass
 
-    return None
+    # --------------------------------------------------------
+    # حوادث سنگین
+    # --------------------------------------------------------
 
+    if any_word(title, ACCIDENT_WORDS):
 
-# =========================================================
-# DIRECT TOPIC SCORE
-# =========================================================
+        if any_word(
+            title,
+            [
+                "کشته",
+                "فوت",
+                "جان باخت",
+                "مصدوم",
+            ],
+        ):
+            score += 6
 
-def direct_topic_score(
-    title: str,
-    description: str
-):
+    # --------------------------------------------------------
+    # منبع معتبر
+    # --------------------------------------------------------
 
-    title = normalize_text(title)
+    score += article.source.priority
 
-    body = normalize_text(
-        description
+    # --------------------------------------------------------
+    # خبرهایی که فقط کلمه ایران دارند رد شوند
+    # --------------------------------------------------------
+
+    title_has_iran = any_word(
+        title,
+        IRAN_COMBO_TERMS,
     )
 
-    score = 0
-    matched = []
+    has_specific_topic = any_word(
+        full,
+        DIRECT_TOPICS,
+    )
 
-    groups = [
-        IRAN_DIRECT,
-        ISRAEL_REGION_DIRECT,
-        RESISTANCE_DIRECT,
-        MARITIME_DIRECT,
+    if title_has_iran and not has_specific_topic:
+
+        score -= 8
+
+    article.score = score
+    article.major = major
+
+    return article
+
+
+def accept_article(article: Article):
+
+    age = age_hours(
+        article.published
+    )
+
+    if age > MAX_NEWS_AGE_HOURS:
+        return False
+
+    title = normalize_text(
+        article.title
+    )
+
+    if len(title) < 12:
+        return False
+
+    # عنوان‌هایی که فقط جنبه عمومی/تبلیغاتی دارند
+    reject_words = [
+        "فال",
+        "هواشناسی روزانه",
+        "قیمت روز",
+        "جدول",
+        "استخدام",
+        "تبریک",
+        "سرگرمی",
+        "آشپزی",
+        "فیلم سینمایی",
+        "ورزش همگانی",
     ]
 
-    for group in groups:
-
-        for term in group:
-
-            if term in title:
-
-                score += 12
-
-                matched.append(
-                    term
-                )
-
-            elif term in body:
-
-                score += 5
-
-                matched.append(
-                    term
-                )
-
-    return score, matched
-
-
-# =========================================================
-# IRAN DIPLOMATIC SCORE
-# =========================================================
-
-def diplomatic_score(
-    title,
-    description
-):
-
-    title = normalize_text(
-        title
-    )
-
-    body = normalize_text(
-        description
-    )
-
-    full = (
-        title
-        + " "
-        + body
-    )
-
-    score = 0
-    matched = []
-
-    # عبارت‌های مستقیم مهم
-    for term in IRAN_DIPLOMATIC_TERMS:
-
-        if term in title:
-
-            score += 10
-            matched.append(
-                term
-            )
-
-        elif term in body:
-
-            score += 3
-            matched.append(
-                term
-            )
-
-    # ترکیب‌های مهم
-    for first, second in IRAN_DIPLOMATIC_COMBINATIONS:
-
-        if (
-            first in title
-            and second in title
-        ):
-
-            score += 18
-
-            matched.append(
-                f"{first}+{second}"
-            )
-
-        elif (
-            first in full
-            and second in full
-        ):
-
-            score += 8
-
-            matched.append(
-                f"{first}+{second}"
-            )
-
-    return score, matched
-
-
-# =========================================================
-# LOCAL INCIDENT SCORE
-# =========================================================
-
-def local_accident_score(
-    title: str,
-    description: str
-):
-
-    title = normalize_text(
-        title
-    )
-
-    body = normalize_text(
-        description
-    )
-
-    full = (
-        title
-        + " "
-        + body
-    )
-
-    if not contains_any(
-        full,
-        ACCIDENT_TERMS
-    ):
-
-        return 0
-
-    severity = 0
-
-    for term in SEVERE_ACCIDENT_TERMS:
-
-        if term in title:
-
-            severity += 8
-
-        elif term in body:
-
-            severity += 3
-
-    magnitude = earthquake_magnitude(
-        full
-    )
-
-    if magnitude is not None:
-
-        if magnitude >= 6:
-            return 40
-
-        if magnitude >= 5.5:
-            return 15
-
-    return severity
-
-
-# =========================================================
-# SCORING
-# =========================================================
-
-def calculate_score(
-    item: NewsItem
-):
-
-    title = normalize_text(
-        item.title
-    )
-
-    body = normalize_text(
-        item.description
-    )
-
-    full = (
-        title
-        + " "
-        + body
-    )
-
-    direct_score, matched = (
-        direct_topic_score(
-            title,
-            body
-        )
-    )
-
-    diplomatic, diplomatic_matches = (
-        diplomatic_score(
-            title,
-            body
-        )
-    )
-
-    event_score = 0
-
-    for term, weight in MAJOR_EVENT_TERMS.items():
-
-        if term in title:
-
-            event_score += (
-                weight * 2
-            )
-
-        elif term in body:
-
-            event_score += weight
-
-    accident_score = local_accident_score(
-        title,
-        body
-    )
-
-    # امتیاز منبع معتبر
-    trusted_bonus = (
-        2
-        if item.source in TRUSTED_SOURCES
-        else 0
-    )
-
-    age = age_hours(
-        item.published
-    )
-
-    freshness_bonus = 0
-
-    if age <= 2:
-        freshness_bonus = 5
-
-    elif age <= 5:
-        freshness_bonus = 3
-
-    elif age <= 8:
-        freshness_bonus = 1
-
-    # امتیاز نهایی
-    item.score = (
-        direct_score
-        + diplomatic
-        + event_score
-        + accident_score
-        + trusted_bonus
-        + freshness_bonus
-    )
-
-    item.event_score = (
-        event_score
-        + diplomatic
-    )
-
-    item.urgency_score = (
-        direct_score
-        + diplomatic
-        + accident_score
-    )
-
-    # خبر خیلی مهم
-    item.is_major = (
-
-        (
-            direct_score >= 12
-            and event_score >= 5
-        )
-
-        or diplomatic >= 18
-
-        or accident_score >= 12
-
-        or (
-            direct_score >= 12
-            and diplomatic >= 10
-        )
-    )
-
-    # زلزله بزرگ
-    magnitude = earthquake_magnitude(
-        full
-    )
-
-    if (
-        magnitude is not None
-        and magnitude >= 6
-    ):
-
-        item.is_major = True
-
-    # خبر بسیار مهم
-    item.is_very_major = (
-
-        magnitude is not None
-        and magnitude >= 6
-    ) or (
-
-        accident_score >= 30
-    ) or (
-
-        direct_score >= 20
-        and event_score >= 12
-        and age <= 3
-    ) or (
-
-        diplomatic >= 30
-        and age <= 6
-    )
-
-    if matched:
-        print(
-            f"MATCHED DIRECT: "
-            f"{matched[:8]}"
-        )
-
-    if diplomatic_matches:
-        print(
-            f"MATCHED DIPLOMATIC: "
-            f"{diplomatic_matches[:8]}"
-        )
-
-    return item
-
-
-# =========================================================
-# FILTER
-# =========================================================
-
-def evaluate(
-    item: NewsItem
-):
-
-    title = normalize_text(
-        item.title
-    )
-
-    body = normalize_text(
-        item.description
-    )
-
-    full = (
-        title
-        + " "
-        + body
-    )
-
-    age = age_hours(
-        item.published
-    )
-
-    magnitude = earthquake_magnitude(
-        full
-    )
-
-    # خبر خیلی قدیمی
-    if age > MAX_AGE_HOURS:
-
-        print(
-            f"FILTER OLD: {item.title}"
-        )
-
+    if any_word(title, reject_words):
         return False
 
-    # تحلیل و یادداشت
-    if (
-        contains_any(
-            title,
-            ANALYSIS_TERMS
-        )
-        and not item.is_major
-    ):
-
-        print(
-            f"FILTER ANALYSIS: "
-            f"{item.title}"
-        )
-
+    # حداقل امتیاز
+    if article.score < 7:
         return False
 
-    # موضوعات غیرخبری
-    if (
-        contains_any(
-            title,
-            EXCLUDE_TERMS
-        )
-        and not item.is_major
-        and item.event_score < 12
-    ):
-
-        print(
-            f"FILTER EXCLUDED: "
-            f"{item.title}"
-        )
-
-        return False
-
-    # زلزله 6 به بالا
-    if (
-        magnitude is not None
-        and magnitude >= 6
-    ):
-
-        return True
-
-    # خبر بسیار مهم
-    if item.is_very_major:
-
-        return True
-
-    # دیپلماتیک بسیار مهم
-    if (
-        item.event_score >= 18
-        and item.urgency_score >= 18
-        and item.score >= MIN_SCORE
-    ):
-
-        return True
-
-    # موضوع مستقیم ایران/منطقه
-    if (
-        item.urgency_score >= 12
-        and item.score >= MIN_SCORE
-    ):
-
-        return True
-
-    # حادثه مهم
-    if (
-        local_accident_score(
-            title,
-            body
-        ) >= 12
-        and item.score >= MIN_SCORE
-    ):
-
-        return True
-
-    return False
+    return True
 
 
-# =========================================================
+# ============================================================
 # EVENT DEDUPLICATION
-# =========================================================
+# ============================================================
 
-PERSIAN_STOPWORDS = {
-
-    "از",
-    "به",
-    "در",
-    "با",
-    "برای",
-    "و",
-    "یا",
-    "که",
-    "را",
-    "این",
-    "آن",
-    "یک",
-
-    "های",
-    "ها",
-
+STOP_WORDS = {
+    "ایران",
+    "ایرانی",
+    "امروز",
+    "امروز",
+    "خبر",
+    "اعلام",
     "شد",
-    "شده",
-    "شدند",
-
     "کرد",
     "کرده",
-    "کردند",
-
-    "می",
-    "شود",
-    "شده",
-
     "خواهد",
-    "خواهند",
-
+    "این",
+    "آن",
+    "برای",
+    "با",
+    "به",
+    "از",
+    "در",
+    "که",
+    "و",
+    "یک",
+    "را",
     "است",
-    "هست",
-    "بود",
-    "باشد",
-
-    "درباره",
-    "علیه",
-
-    "پس",
-    "تا",
-    "بر",
-    "هم",
+    "شدند",
+    "گفت",
+    "گفته",
 }
 
 
-EVENT_GENERIC_WORDS = {
+def title_tokens(title):
 
-    "خبر",
-    "گزارش",
-    "اعلام",
-    "آخرین",
-    "جدید",
-    "مهم",
-    "فوری",
-
-    "امروز",
-    "امشب",
-    "صبح",
-    "عصر",
-
-    "دقایقی",
-    "لحظاتی",
-
-    "جزئیات",
-    "تصاویر",
-
-    "واکنش",
-
-    "تحولات",
-}
-
-
-def normalize_event_title(
-    title
-):
-
-    text = normalize_text(
+    words = normalize_title(
         title
-    ).lower()
+    ).split()
 
-    text = text.replace(
-        "‌",
-        ""
-    )
-
-    text = re.sub(
-        r"[^\w\sآ-ی]",
-        " ",
-        text
-    )
-
-    text = re.sub(
-        r"\d+",
-        " ",
-        text
-    )
-
-    words_list = text.split()
-
-    cleaned = []
-
-    for word in words_list:
-
-        if not word:
-            continue
-
-        if word in PERSIAN_STOPWORDS:
-            continue
-
-        if word in EVENT_GENERIC_WORDS:
-            continue
-
-        if len(word) < 2:
-            continue
-
-        cleaned.append(
-            word
-        )
-
-    return " ".join(
-        cleaned
-    )
+    return {
+        w
+        for w in words
+        if len(w) >= 3
+        and w not in STOP_WORDS
+    }
 
 
-def event_words(
-    title
-):
+def same_event(a: Article, b: Article):
 
-    normalized = normalize_event_title(
-        title
-    )
+    ta = normalize_title(a.title)
+    tb = normalize_title(b.title)
 
-    return set(
-        normalized.split()
-    )
-
-
-def same_event(
-    a: NewsItem,
-    b: NewsItem
-):
-
-    title_a = (
-        getattr(
-            a,
-            "title",
-            ""
-        )
-        or ""
-    )
-
-    title_b = (
-        getattr(
-            b,
-            "title",
-            ""
-        )
-        or ""
-    )
-
-    if not title_a or not title_b:
-        return False
-
-    normalized_a = normalize_event_title(
-        title_a
-    )
-
-    normalized_b = normalize_event_title(
-        title_b
-    )
-
-    # کاملاً یکسان
-    if (
-        normalized_a
-        and normalized_b
-        and normalized_a == normalized_b
-    ):
-
+    if ta == tb:
         return True
 
-    # شباهت زیاد
-    seq = SequenceMatcher(
+    similarity = SequenceMatcher(
         None,
-        normalized_a,
-        normalized_b
+        ta,
+        tb,
     ).ratio()
 
-    if seq >= 0.82:
-        return True
+    tokens_a = title_tokens(a.title)
+    tokens_b = title_tokens(b.title)
 
-    words_a = event_words(
-        title_a
-    )
-
-    words_b = event_words(
-        title_b
-    )
-
-    if not words_a or not words_b:
+    if not tokens_a or not tokens_b:
         return False
 
-    common = (
-        words_a & words_b
-    )
-
-    union = (
-        words_a | words_b
-    )
-
-    jaccard_score = (
-        len(common)
-        / len(union)
-    )
-
-    smaller = min(
-        len(words_a),
-        len(words_b)
-    )
-
     overlap = (
-        len(common)
-        / smaller
-        if smaller
-        else 0
+        len(tokens_a & tokens_b)
+        / max(
+            1,
+            min(
+                len(tokens_a),
+                len(tokens_b),
+            ),
+        )
     )
 
-    # حداقل 3 کلمه اصلی مشترک
-    if (
-        len(common) >= 3
-        and jaccard_score >= 0.45
-    ):
-
+    # عنوان‌های بسیار مشابه
+    if similarity >= 0.78:
         return True
 
-    # بخش بزرگی از تیتر مشترک
-    if (
-        len(common) >= 3
-        and overlap >= 0.65
-    ):
-
+    # برای عنوان‌های خبری نسبتاً مشابه
+    if similarity >= 0.58 and overlap >= 0.70:
         return True
 
-    # عنوان + خلاصه
-    desc_a = (
-        getattr(
-            a,
-            "description",
-            ""
-        )
-        or ""
-    )
+    # اگر ترکیب کلیدی یکسان داشته باشند
+    for x, y in REGIONAL_COMBOS:
 
-    desc_b = (
-        getattr(
-            b,
-            "description",
-            ""
-        )
-        or ""
-    )
-
-    if desc_a and desc_b:
-
-        combined_a = normalize_event_title(
-            title_a
-            + " "
-            + desc_a[:500]
-        )
-
-        combined_b = normalize_event_title(
-            title_b
-            + " "
-            + desc_b[:500]
-        )
-
-        body_similarity = SequenceMatcher(
-            None,
-            combined_a,
-            combined_b
-        ).ratio()
-
-        if body_similarity >= 0.76:
+        if (
+            has_combo(ta, x, y)
+            and has_combo(tb, x, y)
+            and overlap >= 0.55
+        ):
             return True
 
     return False
 
 
-# =========================================================
-# CROSS-SOURCE DEDUPLICATION
-# =========================================================
-
-def dedupe_cross_source(
-    items
+def deduplicate_articles(
+    articles,
+    state: StateStore,
 ):
 
-    items = sorted(
-        items,
+    result = []
+
+    # ابتدا امتیاز بالاتر
+    articles = sorted(
+        articles,
         key=lambda x: (
-            x.is_very_major,
             x.score,
-            x.event_score,
-            x.source in TRUSTED_SOURCES,
+            x.source.priority,
+            x.published,
         ),
         reverse=True,
     )
 
-    result = []
+    for article in articles:
 
-    for item in items:
+        if article.link in state.sent_links:
+            continue
+
+        title_norm = normalize_title(
+            article.title
+        )
+
+        if title_norm in state.sent_titles:
+            continue
 
         duplicate = False
 
-        for old in result:
+        for selected in result:
 
-            # URL
-            if (
-                canonical_url(
-                    item.url
-                )
-                ==
-                canonical_url(
-                    old.url
-                )
-            ):
-
-                print(
-                    "DUPLICATE URL:",
-                    item.title
-                )
-
-                duplicate = True
-                break
-
-            # عنوان دقیق
-            if (
-                title_fingerprint(
-                    item.title
-                )
-                ==
-                title_fingerprint(
-                    old.title
-                )
-            ):
-
-                print(
-                    "DUPLICATE TITLE:",
-                    item.title
-                )
-
-                duplicate = True
-                break
-
-            # رویداد یکسان
             if same_event(
-                item,
-                old
+                article,
+                selected,
             ):
-
-                print(
-                    "DUPLICATE EVENT:"
-                )
-
-                print(
-                    f"  KEEP: "
-                    f"{old.source} | "
-                    f"{old.title}"
-                )
-
-                print(
-                    f"  SKIP: "
-                    f"{item.source} | "
-                    f"{item.title}"
-                )
-
                 duplicate = True
                 break
 
-        if not duplicate:
+        if duplicate:
+            continue
 
-            result.append(
-                item
-            )
+        result.append(article)
 
     return result
 
 
-# =========================================================
-# IMAGE
-# =========================================================
+# ============================================================
+# RSS COLLECTION
+# ============================================================
 
-def find_logo_file():
-
-    for filename in [
-
-        "jahantab_logo_transparent-1.png",
-        "logo.png",
-        "logo.jpg",
-        "logo.jpeg",
-
-    ]:
-
-        if os.path.exists(
-            filename
-        ):
-
-            return filename
-
-    return ""
-
-
-LOGO_FILE = find_logo_file()
-
-
-def download_image(
-    url,
-    filename="_news_image.jpg"
+def parse_feed(
+    source: Source,
+    feed_url: str,
 ):
 
-    if not url:
-        return ""
+    articles = []
 
     try:
 
-        response = SESSION.get(
-            url,
+        response = session.get(
+            feed_url,
             timeout=REQUEST_TIMEOUT,
-            stream=True
+            allow_redirects=True,
         )
 
-        if response.status_code >= 400:
-            return ""
+        if not response.ok:
+            return articles
 
-        content_type = (
-            response.headers
-            .get(
-                "Content-Type",
-                ""
-            )
-            .lower()
+        parsed = feedparser.parse(
+            response.content
         )
 
-        if (
-            "image"
-            not in content_type
-            and not url.lower().endswith(
-                (
-                    ".jpg",
-                    ".jpeg",
-                    ".png",
-                    ".webp",
+        for entry in parsed.entries[:30]:
+
+            title = normalize_text(
+                entry.get(
+                    "title",
+                    "",
                 )
             )
-        ):
 
-            return ""
-
-        with open(
-            filename,
-            "wb"
-        ) as f:
-
-            for chunk in response.iter_content(
-                chunk_size=8192
-            ):
-
-                if chunk:
-                    f.write(chunk)
-
-        image = Image.open(
-            filename
-        )
-
-        image.verify()
-
-        return filename
-
-    except Exception as exc:
-
-        print(
-            f"IMAGE ERROR: {exc}"
-        )
-
-        try:
-
-            if os.path.exists(
-                filename
-            ):
-
-                os.remove(
-                    filename
+            link = normalize_text(
+                entry.get(
+                    "link",
+                    "",
                 )
-
-        except Exception:
-            pass
-
-        return ""
-
-
-def add_logo(
-    image_path
-):
-
-    if not LOGO_FILE:
-        return image_path
-
-    try:
-
-        base = Image.open(
-            image_path
-        ).convert(
-            "RGBA"
-        )
-
-        logo = Image.open(
-            LOGO_FILE
-        ).convert(
-            "RGBA"
-        )
-
-        max_width = max(
-            80,
-            base.width // 6
-        )
-
-        ratio = (
-            max_width
-            / logo.width
-        )
-
-        new_height = int(
-            logo.height
-            * ratio
-        )
-
-        logo = logo.resize(
-            (
-                max_width,
-                new_height
-            ),
-            Image.LANCZOS
-        )
-
-        margin = max(
-            10,
-            base.width // 100
-        )
-
-        x = (
-            base.width
-            - logo.width
-            - margin
-        )
-
-        y = (
-            base.height
-            - logo.height
-            - margin
-        )
-
-        base.alpha_composite(
-            logo,
-            (x, y)
-        )
-
-        output = (
-            "_final_news_image.jpg"
-        )
-
-        base.convert(
-            "RGB"
-        ).save(
-            output,
-            "JPEG",
-            quality=92
-        )
-
-        return output
-
-    except Exception as exc:
-
-        print(
-            f"LOGO ERROR: {exc}"
-        )
-
-        return image_path
-
-
-# =========================================================
-# TELEGRAM CAPTION
-# =========================================================
-
-def build_caption(
-    item: NewsItem
-):
-
-    title = escape_html(
-        shorten(
-            item.title,
-            220
-        )
-    )
-
-    description = escape_html(
-        shorten(
-            item.description,
-            550
-        )
-    )
-
-    source = escape_html(
-        item.source
-    )
-
-    signature = (
-        "🌐 <b>جهان تاب</b> | "
-        "<i>آخرین تحولات جهان</i>\n"
-        "🌐 @jahantab_news"
-    )
-
-    lines = []
-
-    lines.append(
-        f"📰 <b>{title}</b>"
-    )
-
-    lines.append("")
-
-    if description:
-
-        lines.append(
-            description
-        )
-
-        lines.append("")
-
-    lines.append(
-        f"🔗 منبع: {source}"
-    )
-
-    lines.append(
-        "━━━━━━━━━━━━━━━━━━"
-    )
-
-    lines.append(
-        signature
-    )
-
-    caption = "\n".join(
-        lines
-    )
-
-    # محدودیت Telegram
-    if len(caption) > 1000:
-
-        fixed_end = (
-            "\n\n"
-            "🔗 منبع: "
-            + source
-            + "\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            + signature
-        )
-
-        available = (
-            1000
-            - len(fixed_end)
-            - len(title)
-            - 30
-        )
-
-        if available < 100:
-            available = 100
-
-        short_description = escape_html(
-            shorten(
-                item.description,
-                available
-            )
-        )
-
-        lines = [
-            f"📰 <b>{title}</b>",
-            "",
-        ]
-
-        if short_description:
-
-            lines.append(
-                short_description
             )
 
-            lines.append("")
+            if not title or not link:
+                continue
 
-        lines.append(
-            f"🔗 منبع: {source}"
-        )
+            # فقط دامنه‌های مجاز
+            if not is_allowed_url(link):
+                continue
 
-        lines.append(
-            "━━━━━━━━━━━━━━━━━━"
-        )
+            # لینک گوگل یا واسطه‌ای رد شود
+            host = urlparse(
+                link
+            ).netloc.lower()
 
-        lines.append(
-            signature
-        )
-
-        caption = "\n".join(
-            lines
-        )
-
-        if len(caption) > 1000:
-
-            caption = caption[:1000]
-
-    return caption
-
-
-# =========================================================
-# TELEGRAM API
-# =========================================================
-
-def telegram_api(
-    method
-):
-
-    return (
-        "https://api.telegram.org/bot"
-        f"{BOT_TOKEN}/{method}"
-    )
-
-
-def send_photo(
-    item: NewsItem,
-    image_path
-):
-
-    if (
-        not BOT_TOKEN
-        or not CHAT_ID
-    ):
-
-        print(
-            "ERROR: BOT_TOKEN "
-            "or CHAT_ID missing."
-        )
-
-        return False
-
-    keyboard = {
-
-        "inline_keyboard": [
-
-            [
-                {
-                    "text": "مشاهده خبر",
-                    "url": item.url,
-                }
-            ]
-
-        ]
-
-    }
-
-    data = {
-
-        "chat_id": CHAT_ID,
-
-        "caption": build_caption(
-            item
-        ),
-
-        "parse_mode": "HTML",
-
-        "reply_markup": json.dumps(
-            keyboard,
-            ensure_ascii=False
-        ),
-    }
-
-    try:
-
-        with open(
-            image_path,
-            "rb"
-        ) as photo:
-
-            response = SESSION.post(
-                telegram_api(
-                    "sendPhoto"
-                ),
-
-                data=data,
-
-                files={
-                    "photo": photo
-                },
-
-                timeout=40,
-            )
-
-        if response.ok:
-
-            result = response.json()
-
-            if result.get(
-                "ok"
+            if (
+                "google." in host
+                or "news.google." in host
             ):
+                continue
 
-                print(
-                    f"SENT: {item.title}"
+            description = strip_html(
+                entry.get(
+                    "summary",
+                    entry.get(
+                        "description",
+                        "",
+                    ),
                 )
+            )
 
-                return True
+            published = entry_timestamp(
+                entry
+            )
 
-        print(
-            "TELEGRAM ERROR:",
-            response.status_code,
-            response.text[:1000]
+            image_url = (
+                extract_image_from_entry(
+                    entry
+                )
+            )
+
+            article = Article(
+                title=title,
+                link=link,
+                description=description,
+                source=source,
+                published=published,
+                image_url=image_url,
+            )
+
+            # فقط اخبار جدید
+            if age_hours(
+                published
+            ) > MAX_NEWS_AGE_HOURS:
+                continue
+
+            article = extract_article_data(
+                article
+            )
+
+            score_article(article)
+
+            if accept_article(article):
+                articles.append(article)
+
+    except Exception as e:
+
+        log.warning(
+            "FEED ERROR | %s | %s | %s",
+            source.name,
+            feed_url,
+            e,
         )
 
-    except Exception as exc:
-
-        print(
-            f"TELEGRAM SEND ERROR: {exc}"
-        )
-
-    return False
+    return articles
 
 
-# =========================================================
-# COLLECT NEWS
-# =========================================================
+def collect_news(state):
 
-def collect_items():
-
-    all_items = []
+    all_articles = []
 
     for source in SOURCES:
 
-        print(
-            f"\n========== "
-            f"{source.name} "
-            f"=========="
+        log.info(
+            "FETCHING: %s",
+            source.name,
         )
 
         feeds = discover_feeds(
@@ -2765,587 +1324,807 @@ def collect_items():
         )
 
         if not feeds:
-
-            print(
-                "No feeds discovered."
+            log.info(
+                "NO RSS: %s",
+                source.name,
             )
-
             continue
 
-        source_items = []
+        source_articles = []
 
-        for feed_url in feeds:
+        for feed_url in feeds[:6]:
 
-            print(
-                f"Checking: "
-                f"{feed_url}"
-            )
-
-            parsed = parse_feed(
+            items = parse_feed(
+                source,
                 feed_url,
-                source
             )
 
-            source_items.extend(
-                parsed
+            source_articles.extend(
+                items
             )
 
-            if (
-                len(source_items)
-                >= MAX_ITEMS_PER_SOURCE
-            ):
-
-                break
-
-        # حذف URL تکراری
-        unique = []
-
-        seen = set()
-
-        for item in source_items:
-
-            key = canonical_url(
-                item.url
-            )
-
-            if key in seen:
-                continue
-
-            seen.add(key)
-
-            unique.append(
-                item
-            )
-
-        # امتیاز اولیه
-        for item in unique:
-
-            calculate_score(
-                item
-            )
-
-        # اطلاعات صفحه خبر
-        for item in unique[:10]:
-
-            extract_article_data(
-                item
-            )
-
-            calculate_score(
-                item
-            )
-
-        accepted = 0
-
-        for item in unique:
-
-            if evaluate(
-                item
-            ):
-
-                all_items.append(
-                    item
-                )
-
-                accepted += 1
-
-            else:
-
-                print(
-                    f"FILTERED: "
-                    f"{item.title}"
-                )
-
-        print(
-            f"Accepted from "
-            f"{source.name}: "
-            f"{accepted}"
+        all_articles.extend(
+            source_articles
         )
 
-    return all_items
+        log.info(
+            "%s -> %d candidates",
+            source.name,
+            len(source_articles),
+        )
+
+    return all_articles
 
 
-# =========================================================
-# LAST PUBLISH STATE
-# =========================================================
+# ============================================================
+# IMAGE DOWNLOAD
+# ============================================================
 
-def load_last_publish():
+def download_image(url: str):
 
-    if not os.path.exists(
-        LAST_PUBLISH_FILE
-    ):
-
-        return None
+    if not url:
+        return ""
 
     try:
 
-        with open(
-            LAST_PUBLISH_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            value = f.read().strip()
-
-        return float(
-            value
+        response = session.get(
+            url,
+            timeout=REQUEST_TIMEOUT,
+            stream=True,
+            allow_redirects=True,
         )
 
-    except Exception:
+        if not response.ok:
+            return ""
 
-        return None
+        content_type = (
+            response.headers.get(
+                "Content-Type",
+                "",
+            )
+            .lower()
+        )
+
+        if (
+            content_type
+            and not content_type.startswith(
+                "image/"
+            )
+        ):
+            return ""
+
+        with open(
+            IMAGE_FILE,
+            "wb",
+        ) as f:
+
+            size = 0
+
+            for chunk in response.iter_content(
+                chunk_size=8192
+            ):
+
+                if not chunk:
+                    continue
+
+                size += len(chunk)
+
+                # حداکثر 8MB
+                if size > 8 * 1024 * 1024:
+                    return ""
+
+                f.write(chunk)
+
+        # اعتبارسنجی واقعی تصویر
+        try:
+
+            with Image.open(
+                IMAGE_FILE
+            ) as img:
+
+                img.verify()
+
+        except (
+            UnidentifiedImageError,
+            OSError,
+        ):
+
+            try:
+                IMAGE_FILE.unlink()
+            except Exception:
+                pass
+
+            return ""
+
+        return str(IMAGE_FILE)
+
+    except Exception as e:
+
+        log.debug(
+            "IMAGE DOWNLOAD ERROR: %s",
+            e,
+        )
+
+        try:
+            if IMAGE_FILE.exists():
+                IMAGE_FILE.unlink()
+        except Exception:
+            pass
+
+        return ""
 
 
-def save_last_publish():
+# ============================================================
+# IMAGE PROCESSING
+# ============================================================
+
+def prepare_final_image(image_path):
+
+    if not image_path:
+        return ""
 
     try:
 
-        with open(
-            LAST_PUBLISH_FILE,
-            "w",
-            encoding="utf-8"
-        ) as f:
+        with Image.open(
+            image_path
+        ) as img:
 
-            f.write(
-                str(time.time())
+            img = img.convert(
+                "RGB"
             )
 
-    except Exception as exc:
+            max_width = 1280
 
-        print(
-            f"LAST PUBLISH ERROR: {exc}"
+            if img.width > max_width:
+
+                ratio = (
+                    max_width
+                    / img.width
+                )
+
+                img = img.resize(
+                    (
+                        max_width,
+                        int(
+                            img.height
+                            * ratio
+                        ),
+                    ),
+                    Image.LANCZOS,
+                )
+
+            img.save(
+                FINAL_IMAGE_FILE,
+                "JPEG",
+                quality=88,
+                optimize=True,
+            )
+
+        return str(
+            FINAL_IMAGE_FILE
         )
 
+    except Exception as e:
 
-def can_publish_now(
-    has_very_major=False
+        log.warning(
+            "IMAGE PREP ERROR: %s",
+            e,
+        )
+
+        return ""
+
+
+# ============================================================
+# HTML HELPERS
+# ============================================================
+
+def escape_html(text):
+
+    return html.escape(
+        normalize_text(text),
+        quote=False,
+    )
+
+
+def strip_html_for_telegram(text):
+
+    soup = BeautifulSoup(
+        text or "",
+        "html.parser",
+    )
+
+    return normalize_text(
+        html.unescape(
+            soup.get_text(" ")
+        )
+    )
+
+
+def shorten_text(
+    text,
+    max_length,
 ):
 
-    last = load_last_publish()
+    text = normalize_text(
+        text
+    )
 
-    # اولین ارسال
-    if last is None:
+    if len(text) <= max_length:
+        return text
+
+    cut = text[:max_length]
+
+    pos = cut.rfind(" ")
+
+    if pos > max_length * 0.70:
+        cut = cut[:pos]
+
+    return cut.rstrip(
+        " .،؛:!-"
+    ) + "…"
+
+
+# ============================================================
+# AI-LIKE SUMMARY
+# ============================================================
+
+def build_summary(article: Article):
+
+    text = normalize_text(
+        article.description
+    )
+
+    if not text:
+        return "جزئیات بیشتر در منبع اصلی خبر."
+
+    sentences = re.split(
+        r"(?<=[.!؟])\s+",
+        text,
+    )
+
+    sentences = [
+        normalize_text(x)
+        for x in sentences
+        if len(normalize_text(x)) >= 25
+    ]
+
+    if not sentences:
+        return shorten_text(
+            text,
+            500,
+        )
+
+    selected = sentences[:4]
+
+    summary = " ".join(
+        selected
+    )
+
+    return shorten_text(
+        summary,
+        650,
+    )
+
+
+# ============================================================
+# CAPTION
+# ============================================================
+
+SIGNATURE = (
+    "🌐 جهان تاب | آخرین تحولات جهان\n"
+    "🌐 @jahantab_news"
+)
+
+
+def build_caption(article: Article):
+
+    title = escape_html(
+        shorten_text(
+            article.title,
+            250,
+        )
+    )
+
+    summary = escape_html(
+        build_summary(article)
+    )
+
+    source = escape_html(
+        article.source.name
+    )
+
+    caption = (
+        f"<b>📰 {title}</b>\n\n"
+        f"{summary}\n\n"
+        f"🔗 منبع: {source}\n\n"
+        f"{SIGNATURE}"
+    )
+
+    # Telegram sendPhoto caption limit
+    if len(caption) > 1024:
+
+        allowed_summary = (
+            1024
+            - len(
+                f"<b>📰 {title}</b>\n\n"
+                f"\n\n🔗 منبع: {source}\n\n"
+                f"{SIGNATURE}"
+            )
+            - 10
+        )
+
+        if allowed_summary < 100:
+            allowed_summary = 100
+
+        summary = escape_html(
+            shorten_text(
+                build_summary(article),
+                allowed_summary,
+            )
+        )
+
+        caption = (
+            f"<b>📰 {title}</b>\n\n"
+            f"{summary}\n\n"
+            f"🔗 منبع: {source}\n\n"
+            f"{SIGNATURE}"
+        )
+
+    return caption
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+TELEGRAM_API = (
+    "https://api.telegram.org/bot"
+)
+
+
+def telegram_request(
+    method,
+    data=None,
+    files=None,
+):
+
+    url = (
+        TELEGRAM_API
+        + BOT_TOKEN
+        + "/"
+        + method
+    )
+
+    for attempt in range(5):
+
+        try:
+
+            response = session.post(
+                url,
+                data=data,
+                files=files,
+                timeout=40,
+            )
+
+            if response.status_code == 429:
+
+                try:
+                    retry_after = int(
+                        response.json()
+                        .get("parameters", {})
+                        .get("retry_after", 10)
+                    )
+                except Exception:
+                    retry_after = 10
+
+                log.warning(
+                    "Telegram flood wait: %ss",
+                    retry_after,
+                )
+
+                time.sleep(
+                    retry_after + 1
+                )
+
+                continue
+
+            return response
+
+        except Exception as e:
+
+            log.warning(
+                "Telegram request error attempt=%d: %s",
+                attempt + 1,
+                e,
+            )
+
+            time.sleep(
+                2 ** attempt
+            )
+
+    return None
+
+
+def send_photo(article: Article):
+
+    caption = build_caption(
+        article
+    )
+
+    image_path = ""
+
+    if article.image_url:
+
+        image_path = download_image(
+            article.image_url
+        )
+
+        if image_path:
+
+            image_path = prepare_final_image(
+                image_path
+            )
+
+    # --------------------------------------------------------
+    # عکس
+    # --------------------------------------------------------
+
+    if image_path:
+
+        try:
+
+            with open(
+                image_path,
+                "rb",
+            ) as photo:
+
+                response = telegram_request(
+                    "sendPhoto",
+                    data={
+                        "chat_id": CHAT_ID,
+                        "caption": caption,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": "true",
+                        "reply_markup": (
+                            '{"inline_keyboard":'
+                            '[[{"text":"مشاهده خبر",'
+                            f'"url":"{article.link}"}]]}'
+                        ),
+                    },
+                    files={
+                        "photo": photo,
+                    },
+                )
+
+            if response is not None:
+
+                try:
+                    result = response.json()
+                except Exception:
+                    result = {}
+
+                if result.get("ok"):
+                    return True
+
+                # اگر مشکل HTML بود، دوباره بدون HTML
+                description = (
+                    strip_html_for_telegram(
+                        build_summary(article)
+                    )
+                )
+
+                plain_caption = (
+                    f"📰 {article.title}\n\n"
+                    f"{description}\n\n"
+                    f"🔗 منبع: {article.source.name}\n\n"
+                    f"{SIGNATURE}"
+                )
+
+                with open(
+                    image_path,
+                    "rb",
+                ) as photo:
+
+                    response2 = telegram_request(
+                        "sendPhoto",
+                        data={
+                            "chat_id": CHAT_ID,
+                            "caption": plain_caption[:1024],
+                            "reply_markup": (
+                                '{"inline_keyboard":'
+                                '[[{"text":"مشاهده خبر",'
+                                f'"url":"{article.link}"}]]}'
+                            ),
+                        },
+                        files={
+                            "photo": photo,
+                        },
+                    )
+
+                if response2 is not None:
+
+                    try:
+                        return bool(
+                            response2.json().get(
+                                "ok"
+                            )
+                        )
+                    except Exception:
+                        return False
+
+        except Exception as e:
+
+            log.warning(
+                "SEND PHOTO ERROR: %s",
+                e,
+            )
+
+    # --------------------------------------------------------
+    # بدون عکس
+    # --------------------------------------------------------
+
+    return send_message(
+        article
+    )
+
+
+def send_message(article: Article):
+
+    summary = strip_html_for_telegram(
+        build_summary(article)
+    )
+
+    text = (
+        f"📰 {article.title}\n\n"
+        f"{summary}\n\n"
+        f"🔗 منبع: {article.source.name}\n\n"
+        f"{SIGNATURE}"
+    )
+
+    text = text[:4096]
+
+    try:
+
+        response = telegram_request(
+            "sendMessage",
+            data={
+                "chat_id": CHAT_ID,
+                "text": text,
+                "disable_web_page_preview": "false",
+                "reply_markup": (
+                    '{"inline_keyboard":'
+                    '[[{"text":"مشاهده خبر",'
+                    f'"url":"{article.link}"}]]}'
+                ),
+            },
+        )
+
+        if response is None:
+            return False
+
+        try:
+            return bool(
+                response.json().get(
+                    "ok"
+                )
+            )
+        except Exception:
+            return False
+
+    except Exception as e:
+
+        log.warning(
+            "SEND MESSAGE ERROR: %s",
+            e,
+        )
+
+        return False
+
+
+# ============================================================
+# PUBLISH INTERVAL
+# ============================================================
+
+def can_publish(
+    state: StateStore,
+    major: bool,
+):
+
+    if not state.last_publish:
         return True
+
+    interval = (
+        MAJOR_INTERVAL
+        if major
+        else NORMAL_INTERVAL
+    )
 
     elapsed = (
         time.time()
-        - last
-    ) / 60
-
-    print(
-        f"Minutes since last "
-        f"publish: {elapsed:.1f}"
+        - state.last_publish
     )
 
-    # خبر فوق مهم
-    if has_very_major:
+    if elapsed < interval:
 
-        return elapsed >= 10
+        remaining = int(
+            interval - elapsed
+        )
 
-    # خبر عادی
-    return elapsed >= 15
+        log.info(
+            "PUBLISH BLOCKED | remaining=%ss",
+            remaining,
+        )
+
+        return False
+
+    return True
 
 
-# =========================================================
-# PREVIOUS EVENT CHECK
-# =========================================================
+# ============================================================
+# SELECT BEST NEWS
+# ============================================================
 
-def is_previous_event_duplicate(
-    item: NewsItem,
-    sent_titles
+def select_best_article(
+    articles,
+    state,
 ):
 
-    for old_title in sent_titles:
-
-        if not old_title.startswith(
-            "TITLE:"
-        ):
-            continue
-
-        previous_title = (
-            old_title[6:].strip()
-        )
-
-        if not previous_title:
-            continue
-
-        previous_item = NewsItem(
-            title=previous_title,
-            url="",
-            source="",
-            domain="",
-            description=""
-        )
-
-        if same_event(
-            item,
-            previous_item
-        ):
-
-            print(
-                "SKIP: semantic duplicate "
-                "of previously published news"
-            )
-
-            print(
-                f"OLD: {previous_title}"
-            )
-
-            print(
-                f"NEW: {item.title}"
-            )
-
-            return True
-
-    return False
-
-
-# =========================================================
-# SELECT ONE NEWS
-# =========================================================
-
-def select_items(
-    items,
-    sent_links,
-    sent_titles
-):
-
-    candidates = []
-
-    for item in items:
-
-        link = canonical_url(
-            item.url
-        )
-
-        title_hash = (
-            title_fingerprint(
-                item.title
-            )
-        )
-
-        # لینک قبلاً ارسال شده
-        if link in sent_links:
-
-            print(
-                f"SKIP: already sent URL: "
-                f"{item.title}"
-            )
-
-            continue
-
-        # تیتر دقیقاً قبلاً ارسال شده
-        if title_hash in sent_titles:
-
-            print(
-                f"SKIP: already sent title: "
-                f"{item.title}"
-            )
-
-            continue
-
-        # رویداد قبلاً ارسال شده
-        if is_previous_event_duplicate(
-            item,
-            sent_titles
-        ):
-
-            continue
-
-        candidates.append(
-            item
-        )
-
-    # حذف خبرهای تکراری همین اجرا
-    candidates = dedupe_cross_source(
-        candidates
+    articles = deduplicate_articles(
+        articles,
+        state,
     )
 
-    candidates.sort(
+    if not articles:
+        return None
+
+    # مرتب‌سازی نهایی
+    articles.sort(
         key=lambda x: (
-            x.is_very_major,
+            x.major,
             x.score,
-            x.event_score,
-            x.source in TRUSTED_SOURCES,
+            x.source.priority,
+            x.published,
         ),
         reverse=True,
     )
 
-    if not candidates:
-        return []
+    for article in articles:
 
-    very_major_exists = any(
-        x.is_very_major
-        for x in candidates
-    )
+        if can_publish(
+            state,
+            article.major,
+        ):
+            return article
 
-    if not can_publish_now(
-        very_major_exists
+    return None
+
+
+# ============================================================
+# CLEAN TEMP FILES
+# ============================================================
+
+def cleanup():
+
+    for path in (
+        IMAGE_FILE,
+        FINAL_IMAGE_FILE,
     ):
 
-        print(
-            "WAIT: publish interval "
-            "has not arrived."
-        )
+        try:
 
-        return []
+            if path.exists():
+                path.unlink()
 
-    return [
-        candidates[0]
-    ]
+        except Exception:
+            pass
 
 
-# =========================================================
-# SAVE SENT
-# =========================================================
-
-def save_sent(
-    item: NewsItem
-):
-
-    # لینک
-    append_line(
-        SENT_LINKS_FILE,
-        canonical_url(
-            item.url
-        )
-    )
-
-    # هش تیتر
-    append_line(
-        SENT_TITLES_FILE,
-        title_fingerprint(
-            item.title
-        )
-    )
-
-    # تیتر نرمال‌شده
-    append_line(
-        SENT_TITLES_FILE,
-        "TITLE:"
-        + normalize_event_title(
-            item.title
-        )
-    )
-
-
-# =========================================================
-# RUN
-# =========================================================
-
-def run_once():
-
-    print(
-        "=========================================="
-    )
-
-    print(
-        VERSION
-    )
-
-    print(
-        "=========================================="
-    )
-
-    if not BOT_TOKEN:
-
-        print(
-            "ERROR: BOT_TOKEN missing."
-        )
-
-        return
-
-    if not CHAT_ID:
-
-        print(
-            "ERROR: CHAT_ID missing."
-        )
-
-        return
-
-    sent_links = load_lines(
-        SENT_LINKS_FILE
-    )
-
-    sent_titles = load_lines(
-        SENT_TITLES_FILE
-    )
-
-    print(
-        f"Already sent links: "
-        f"{len(sent_links)}"
-    )
-
-    print(
-        f"Already sent titles: "
-        f"{len(sent_titles)}"
-    )
-
-    print(
-        "Collecting and filtering news..."
-    )
-
-    items = collect_items()
-
-    print(
-        f"Accepted candidates: "
-        f"{len(items)}"
-    )
-
-    selected = select_items(
-        items,
-        sent_links,
-        sent_titles
-    )
-
-    print(
-        f"Selected: "
-        f"{len(selected)}"
-    )
-
-    if not selected:
-
-        print(
-            "NO NEW NEWS TO PUBLISH"
-        )
-
-        return
-
-    for item in selected:
-
-        print(
-            "------------------------------------------"
-        )
-
-        print(
-            f"Publishing: "
-            f"{item.title}"
-        )
-
-        print(
-            f"Source: "
-            f"{item.source}"
-        )
-
-        print(
-            f"Score: "
-            f"{item.score}"
-        )
-
-        print(
-            f"VERY MAJOR: "
-            f"{item.is_very_major}"
-        )
-
-        print(
-            f"Published: "
-            f"{item.published}"
-        )
-
-        # اگر تصویر RSS نداشت
-        if not item.image:
-
-            extract_article_data(
-                item
-            )
-
-        image_path = download_image(
-            item.image
-        )
-
-        if not image_path:
-
-            print(
-                "No valid image."
-            )
-
-            print(
-                "News will not be published."
-            )
-
-            continue
-
-        final_image = add_logo(
-            image_path
-        )
-
-        if send_photo(
-            item,
-            final_image
-        ):
-
-            # ذخیره خبر
-            save_sent(
-                item
-            )
-
-            # ثبت زمان
-            save_last_publish()
-
-            sent_links.add(
-                canonical_url(
-                    item.url
-                )
-            )
-
-            sent_titles.add(
-                title_fingerprint(
-                    item.title
-                )
-            )
-
-            sent_titles.add(
-                "TITLE:"
-                + normalize_event_title(
-                    item.title
-                )
-            )
-
-            time.sleep(
-                POST_DELAY
-            )
-
-        # پاک‌سازی
-        for filename in (
-            "_news_image.jpg",
-            "_final_news_image.jpg",
-        ):
-
-            try:
-
-                if os.path.exists(
-                    filename
-                ):
-
-                    os.remove(
-                        filename
-                    )
-
-            except Exception:
-                pass
-
-    print(
-        "=========================================="
-    )
-
-    print(
-        "RUN FINISHED"
-    )
-
-    print(
-        "=========================================="
-    )
-
-
-# =========================================================
+# ============================================================
 # MAIN
-# =========================================================
+# ============================================================
 
 def main():
 
-    run_once()
+    print("=" * 70)
+    print(VERSION)
+    print("=" * 70)
 
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN is not set."
+        )
+
+    ensure_state_dir()
+
+    state = StateStore()
+
+    log.info(
+        "Already sent: %d",
+        len(state.sent_links),
+    )
+
+    articles = collect_news(
+        state
+    )
+
+    log.info(
+        "TOTAL CANDIDATES: %d",
+        len(articles),
+    )
+
+    if not articles:
+
+        log.info(
+            "NO NEWS PUBLISHED"
+        )
+
+        return
+
+    best = select_best_article(
+        articles,
+        state,
+    )
+
+    if not best:
+
+        log.info(
+            "NO SUITABLE NEWS"
+        )
+
+        return
+
+    log.info(
+        "SELECTED: %s | %s | score=%s | major=%s",
+        best.source.name,
+        best.title,
+        best.score,
+        best.major,
+    )
+
+    success = send_photo(
+        best
+    )
+
+    if success:
+
+        state.mark_sent(
+            best.link,
+            best.title,
+        )
+
+        log.info(
+            "PUBLISHED SUCCESSFULLY"
+        )
+
+    else:
+
+        log.error(
+            "PUBLISH FAILED - STATE NOT UPDATED"
+        )
+
+    cleanup()
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
 
-    main()
+    try:
+        main()
+
+    except KeyboardInterrupt:
+
+        log.info(
+            "STOPPED BY USER"
+        )
+
+    except Exception as e:
+
+        log.exception(
+            "FATAL ERROR: %s",
+            e,
+        )
+
+        raise
