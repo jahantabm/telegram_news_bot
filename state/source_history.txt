@@ -1,6 +1,5 @@
 asriran.com
 entekhab.ir
-fararu.com
 ilna.ir
 irna.ir
 isna.ir
@@ -9,4 +8,5 @@ khabaronline.ir
 mashreghnews.ir
 mehrnews.com
 roozplus.com
+tabnak.ir
 yjc.ir
